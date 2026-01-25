@@ -36,6 +36,11 @@ enum State {
     SCANNING        // Automated scanning mode
 };
 
+enum bitState {
+    DEPTH_8BIT,
+    DEPTH_16BIT
+};
+
 class ScannerApp : public QWidget {
     Q_OBJECT
 
@@ -67,13 +72,14 @@ private:
     // State
     State currentState_;
     bool scanning_;
+    bitState photoBitDepth = DEPTH_8BIT;
     bool lightOn_;
     bool fanOn_;
     bool motorsEnabled_;
     int frameCount_;
     std::string exportFolder_;
     std::string imageFilePrefix_ = "image_";     //Prefix for saved image files ie "old_cars" + .png
-    bool focusZoomedIn_;                         //In preview, show the frame non-scaled
+    bool focusZoomedIn_ = false;                         //In preview, show the frame non-scaled
     
     // Film parameters
     float spoolDiameter_;
@@ -81,9 +87,10 @@ private:
     
     // Sprocket detection
     int sprocketBrightnessThreshold_;
-    int sprocketMinHeight_;
+    int sprocketMinHeight_ = 500;
     cv::Point sprocketCenter_;
     bool sprocketDetected_;
+    cv::Rect boundingRect;
 
     int leftSprocketEdge = 500;
     int rightSprocketEdge = 750;
@@ -114,13 +121,16 @@ private:
     QLabel* videoLabel_;        //Preview window, left uppper
     QLabel* adjustmentLabel_;   //Under preview window, left lower
 
-    QPushButton* focusButton_ = new QPushButton("Focus Off");
+    QPushButton* focusButton_ = new QPushButton("Focus On");
     QPushButton* previewButton_ = new QPushButton("Preview Mode");
     QPushButton* setupButton_ = new QPushButton("Setup Mode");
     QPushButton* scanButton_ = new QPushButton("Start Scan");
     QPushButton* stopButton_ = new QPushButton("Stop Scan");
+    QPushButton* switch8bitDepthButton_ = new QPushButton("8-bit Depth");
+    QPushButton* switch16bitDepthButton_ = new QPushButton("16-bit Depth");
 
     QPushButton* setSpoolDiameterButton = new QPushButton("Set Spool Diameter");
+    QPushButton* setSkipTakeupFrameButton = new QPushButton("Set Skip Takeup Frames");
     QPushButton* fineButtonForward = new QPushButton("<< Fine Forward");
     QPushButton* nudgeButtonForward = new QPushButton("<< Nudge Forward");
     QPushButton* advance1Button = new QPushButton("<< Frame +1");
@@ -131,8 +141,8 @@ private:
     QPushButton* advance50Button = new QPushButton("<< Frame +50");
     QPushButton* advance100Button = new QPushButton("<< Frame +100");
 
-    QPushButton* lightButton_ = new QPushButton("Light: OFF");
-    QPushButton* fanButton_ = new QPushButton("Fan: OFF");
+    QPushButton* lightButton_ = new QPushButton("Light: ON");
+    QPushButton* fanButton_ = new QPushButton("Fan: ON");
     QPushButton* motorsButton_ = new QPushButton("Motors: OFF");
     QPushButton* setImagePrefixButton_ = new QPushButton("Set Image Prefix");
     QPushButton* exportFolderButton_ = new QPushButton("Set Export Folder");
@@ -141,6 +151,7 @@ private:
     QSlider* sprocketHeightSlider_;
     QSlider* sprocketDetectHeightSlider_;
     QLineEdit* spoolDiameterEdit_;
+    QLineEdit* skipTakeupFrameEdit_;
     QSlider* leftSprocketDetectSlider_;
     QSlider* rightSprocketDetectSlider_;
     QSlider* leftScanEdgeSlider_;
@@ -152,7 +163,7 @@ private:
     cv::Mat frame;              //Temp
     cv::Mat currentFrame_;
     cv::Mat setupFrame_;
-    cv::Mat scanFrame_;
+    cv::Mat scannedFrame_;
     
     // Helper methods
     void initializeUI();
@@ -161,12 +172,13 @@ private:
     void updateVideoDisplay(const cv::Mat& frame);
     void compute_move_per_frame();
     void advanceFilmTracking(float frames, float speed, bool waitForResponse = false);
-    int computeSkipFrameTarget(float spool_diameter_mm);
     void computeMovePerFrame();
     void drawPreviewOverlay(cv::Mat& frame);
+    
     float computeFocusScore(const cv::Mat &image);
     void drawSetupOverlay(cv::Mat& frame);
     void drawScanningOverlay(cv::Mat& frame);
+    void findSprocket(const cv::Mat& frame);
     void scanSingleFrame();
     cv::Mat processFrame(const cv::Mat& input);
 
@@ -187,7 +199,8 @@ ScannerApp::ScannerApp(QWidget* parent)
       fanOn_(false),
       motorsEnabled_(false),
       frameCount_(0),
-      exportFolder_(Config::DEFAULT_EXPORT_FOLDER),
+      exportFolder_(""),
+      focusZoomedIn_(false),
       spoolDiameter_(Config::BASE_SPOOL_DIAMETER),
       sprocketBrightnessThreshold_(Config::SPROCKET_THRESHOLD_DEFAULT),
       sprocketDetected_(false) {
@@ -244,12 +257,12 @@ void ScannerApp::initializeUI() {
 
     adjustmentLayout->addWidget(createLabel("SPROCKET MINIMUM HEIGHT"), 2, 0);
     sprocketHeightSlider_ = new QSlider(Qt::Horizontal);
-    sprocketHeightSlider_->setRange(300, 500);              //Pixels
+    sprocketHeightSlider_->setRange(200, 1000);              //Pixels
     sprocketHeightSlider_->setValue(sprocketMinHeight_);
     sprocketHeightSlider_->setStyleSheet("padding: 5px;");
     adjustmentLayout->addWidget(sprocketHeightSlider_, 3, 0);
 
-    adjustmentLayout->addWidget(createLabel("SPROCKET DETECTION HEIGHT"), 4, 0);
+    adjustmentLayout->addWidget(createLabel("SPROCKET DETECTION AREA"), 4, 0);
     sprocketDetectHeightSlider_ = new QSlider(Qt::Horizontal);
     sprocketDetectHeightSlider_->setRange(300, 1500);       //Pixels
     sprocketDetectHeightSlider_->setValue(sprocketDetectHeight);
@@ -310,21 +323,27 @@ void ScannerApp::initializeUI() {
     rightLayout->addWidget(spoolDiameterEdit_, 1, 0);       //The text
     rightLayout->addWidget(setSpoolDiameterButton, 2, 0);   //The set button
 
+    rightLayout->addWidget(createLabel("Skip takeup every frames"), 3, 0);      //The label
+    skipTakeupFrameEdit_ = new QLineEdit(QString::number(skipFrameTarget));
+    skipTakeupFrameEdit_->setStyleSheet("background-color: white; color: black; padding: 5px; font-size: 14px;");
+    rightLayout->addWidget(skipTakeupFrameEdit_, 4, 0);       //The text
+    rightLayout->addWidget(setSkipTakeupFrameButton, 5, 0);   //The set button
+
     // Hardware controls buttons
-    rightLayout->addWidget(lightButton_, 3, 0);
-    rightLayout->addWidget(fanButton_, 4, 0);
-    rightLayout->addWidget(motorsButton_, 5, 0);
+    rightLayout->addWidget(lightButton_, 6, 0);
+    rightLayout->addWidget(fanButton_, 7, 0);
+    rightLayout->addWidget(motorsButton_, 8, 0);
 
     // Film control buttons
-    rightLayout->addWidget(fineButtonForward, 6, 0);
-    rightLayout->addWidget(nudgeButtonForward, 7, 0);
-    rightLayout->addWidget(advance1Button, 8, 0);
-    rightLayout->addWidget(fineButtonBack, 9, 0);
-    rightLayout->addWidget(nudgeButtonBack, 10, 0);
-    rightLayout->addWidget(rewind1Button, 11, 0);
-    rightLayout->addWidget(advance10Button, 12, 0);
-    rightLayout->addWidget(advance50Button, 13, 0);
-    rightLayout->addWidget(advance100Button, 14, 0);
+    rightLayout->addWidget(fineButtonForward, 9, 0);
+    rightLayout->addWidget(nudgeButtonForward, 10, 0);
+    rightLayout->addWidget(advance1Button, 11, 0);
+    rightLayout->addWidget(fineButtonBack, 12, 0);
+    rightLayout->addWidget(nudgeButtonBack, 13, 0);
+    rightLayout->addWidget(rewind1Button, 14, 0);
+    rightLayout->addWidget(advance10Button, 15, 0);
+    rightLayout->addWidget(advance50Button, 16, 0);
+    rightLayout->addWidget(advance100Button, 17, 0);
 
 
     //RIGHT COLUMN CONTROLS----------------------
@@ -420,14 +439,24 @@ void ScannerApp::connectSignals() {
             spoolDiameter_ = newDiameter;
             spool_diameter_mm_ = newDiameter;
             computeMovePerFrame();
-            skipFrameTarget = computeSkipFrameTarget(spool_diameter_mm_);
+            //skipFrameTarget = computeSkipFrameTarget(spool_diameter_mm_);
             std::cout << "Spool diameter set to " << spoolDiameter_ << " mm" << std::endl;
         } else {
             QMessageBox::warning(this, "Invalid Input", "Please enter a valid positive number for spool diameter.");
             spoolDiameterEdit_->setText(QString::number(spoolDiameter_, 'f', 2));
         }
     });
-
+    connect(setSkipTakeupFrameButton, &QPushButton::clicked, [this]() {
+        bool ok;
+        int newSkipTarget = skipTakeupFrameEdit_->text().toInt(&ok);
+        if (ok && newSkipTarget > -1) {
+            skipFrameTarget = newSkipTarget;
+            std::cout << "Skip takeup frame target set to " << skipFrameTarget << std::endl;
+        } else {
+            QMessageBox::warning(this, "Invalid Input", "Please enter a valid non-negative integer for skip takeup frames.");
+            skipTakeupFrameEdit_->setText(QString::number(skipFrameTarget));
+        }
+    });
     connect(fineButtonForward, &QPushButton::clicked, [this]() {
         advanceFilmTracking(0.025f, 250.0f);
     });
@@ -519,7 +548,7 @@ void ScannerApp::initializeHardware() {
     // Start update timer immediately
     computeMovePerFrame();
     std::cout << "Starting update timer..." << std::endl;
-    updateTimer_->start(33);  // ~30 FPS update
+    updateTimer_->start(16);  // ~60 FPS update
     std::cout << "Camera initialization complete!" << std::endl;
 
     // Initialize Marlin controller
@@ -659,7 +688,6 @@ void ScannerApp::updateFrame() {
                     displayFrame = displayFrame.clone();
                 }
 
-                //detectSprocket(displayFrame);
                 drawSetupOverlay(displayFrame);
                 updateVideoDisplay(displayFrame);
 
@@ -679,14 +707,7 @@ void ScannerApp::updateFrame() {
 void ScannerApp::updateVideoDisplay(const cv::Mat& frame) {
 
     if (frame.empty()) return;
-    
-    // Frame should already be 8-bit at this point
-    if (frame.depth() != CV_8U || frame.channels() != 3) {
-        std::cerr << "ERROR: Expected CV_8UC3, got depth=" << frame.depth() 
-                  << " channels=" << frame.channels() << std::endl;
-        return;
-    }
-    
+
     // Ensure continuous memory
     cv::Mat continuous = frame.isContinuous() ? frame : frame.clone();
 
@@ -752,7 +773,7 @@ void ScannerApp::drawPreviewOverlay(cv::Mat& frame) {
     cv::line(frame, cv::Point(centerX, centerY - 250), cv::Point(centerX, centerY + 250), 
              cv::Scalar(255, 255, 255), 2);
         
-    drawText(frame, "PREVIEW", 10, 30, 2);
+    drawText(frame, "PREVIEW", 10, 60, 2);
 
 }
 
@@ -791,7 +812,147 @@ void ScannerApp::drawSetupOverlay(cv::Mat& frame) {
         return;
     }
 
-    int centerY = frame.rows / 2;
+    findSprocket(frame);        //Sets bool and makes rectangle if found within parameters
+    int centerY;
+
+    if (sprocketDetected_) {
+        centerY = sprocketCenter_.y;    //Vert ref lines based on sprocket center, NOT screen center
+
+        cv::rectangle(frame, 
+                      cv::Point(boundingRect.x + leftSprocketEdge, boundingRect.y),
+                      cv::Point(boundingRect.x + leftSprocketEdge + boundingRect.width, boundingRect.y + boundingRect.height),
+                      cv::Scalar(255, 0, 255), 8);
+
+        drawText(frame, "FOUND", 20, boundingRect.y + 25 + boundingRect.height / 2, 5.0);
+
+    }
+    else {
+        centerY = frame.rows / 2;
+    }
+
+    drawText(frame, "SPROCKET DETECTION AREA", 20, centerY - (sprocketDetectHeight / 2) - 25, 1.5);
+    cv::line(frame, cv::Point(0, centerY - (sprocketDetectHeight / 2)), 
+             cv::Point(rightSprocketEdge, centerY - (sprocketDetectHeight / 2)), 
+             cv::Scalar(255, 255, 0), 2);
+    cv::line(frame, cv::Point(0, centerY + (sprocketDetectHeight / 2)), 
+             cv::Point(rightSprocketEdge, centerY + (sprocketDetectHeight / 2)), 
+             cv::Scalar(255, 255, 0), 2);
+
+    drawText(frame, "SPROCKET MIN HEIGHT", 20, centerY - (sprocketMinHeight_ / 2) - 25, 1.5);
+    cv::line(frame, cv::Point(0, centerY - sprocketMinHeight_ / 2), 
+             cv::Point(leftSprocketEdge - 10, centerY - sprocketMinHeight_ / 2), 
+             cv::Scalar(255, 0, 0), 4);
+    cv::line(frame, cv::Point(0, centerY + sprocketMinHeight_ / 2), 
+             cv::Point(leftSprocketEdge - 10, centerY + sprocketMinHeight_ / 2), 
+             cv::Scalar(255, 0, 0), 4);
+
+    //Draw vertical lines
+    drawText(frame, "L", leftSprocketEdge - 50, 50, 5.0);
+    cv::line(frame, cv::Point(leftSprocketEdge, 0), cv::Point(leftSprocketEdge, frame.rows), 
+             cv::Scalar(0, 0, 255), 8);
+    drawText(frame, "R", rightSprocketEdge + 50, 50, 5.0);
+    cv::line(frame, cv::Point(rightSprocketEdge, 0), cv::Point(rightSprocketEdge, frame.rows), 
+             cv::Scalar(255, 0, 0), 8);
+
+    cv::line(frame, cv::Point(leftScanEdge, 0), cv::Point(leftScanEdge, frame.rows), 
+             cv::Scalar(0, 255, 255), 8);
+    cv::line(frame, cv::Point(rightScanEdge, 0), cv::Point(rightScanEdge, frame.rows), 
+             cv::Scalar(0, 255, 255), 8);
+
+    // Draw frame scan guide
+    drawText(frame, "SCAN FRAME", leftScanEdge + 20, centerY - (verticalScanHeight / 2) - 25, 1.5);
+    cv::Rect frameRect(leftScanEdge, centerY - (verticalScanHeight / 2), 
+                      rightScanEdge - leftScanEdge, verticalScanHeight);
+    cv::rectangle(frame, frameRect, cv::Scalar(0, 255, 255), 8);
+
+    // Draw overlay specific to setup mode
+    drawText(frame, "SETUP", 20, 200, 5);
+
+}
+
+void ScannerApp::scanSingleFrame() {
+
+    if (!scanning_) return;
+    
+    if (!camera_.capturePhoto(scannedFrame_)) {
+        std::cerr << "Failed to capture photo" << std::endl;
+        return;
+    }
+    
+    if (scannedFrame_.empty()) {
+        std::cerr << "Captured photo is empty" << std::endl;
+        return;
+    }
+
+    cv::flip(scannedFrame_, scannedFrame_, 1);                //Flip frame horizontally
+    findSprocket(scannedFrame_);
+
+    cv::Mat croppedFrame;
+
+    if (sprocketDetected_) {
+        //Crop to frame area based on sprocket center
+        int centerY = sprocketCenter_.y;
+        cv::Rect frameRect(leftScanEdge, centerY - (verticalScanHeight / 2), 
+                          rightScanEdge - leftScanEdge, verticalScanHeight);
+
+        croppedFrame = scannedFrame_(frameRect).clone(); //Clone to ensure continuous memory
+
+        //Draw rectangle on scannedFrame_ for display (not export)
+        cv::rectangle(scannedFrame_, 
+                      cv::Point(boundingRect.x + leftSprocketEdge, boundingRect.y),
+                      cv::Point(boundingRect.x + leftSprocketEdge + boundingRect.width, boundingRect.y + boundingRect.height),
+                      cv::Scalar(255, 255, 255), 8);
+     
+    }
+    else {
+        // No sprocket detected - skip this frame
+        std::cerr << "Sprocket not detected, skipping frame" << std::endl;
+        advanceFilmTracking(1.0f, 3000.0f);
+        return;
+    }
+    
+    // Validate cropped frame before saving
+    if (croppedFrame.empty()) {
+        std::cerr << "Cropped frame is empty, skipping" << std::endl;
+        advanceFilmTracking(1.0f, 3000.0f);
+        return;
+    }
+    
+    // Process and save
+    std::ostringstream oss;
+    oss << exportFolder_ << "/" << imageFilePrefix_ 
+        << std::setfill('0') << std::setw(5) << frameCount_ << ".png";
+    std::string filename = oss.str();
+    
+    // Camera actually outputs BGR despite RGB161616 name - convert to RGB for correct colors
+    cv::Mat rgbFrame;
+    cv::cvtColor(croppedFrame, rgbFrame, cv::COLOR_BGR2RGB);
+    cv::imwrite(filename, rgbFrame);
+    
+    frameCount_++;
+
+    // Convert to 8-bit if needed before sending to display
+    if (scannedFrame_.depth() == CV_16U) {
+        scannedFrame_.convertTo(scannedFrame_, CV_8U, 1.0 / 256.0);
+    }
+    
+    // Update display
+    updateVideoDisplay(scannedFrame_);
+    
+    // Advance film
+    advanceFilmTracking(1.0f, 3000.0f); // Move the film forward by one frame
+
+
+
+
+}
+
+void ScannerApp::findSprocket(const cv::Mat& frame) {
+
+    if (frame.empty()) {
+        sprocketDetected_ = false;
+        return;
+    }
 
     // Convert to grayscale
     cv::Mat gray;
@@ -802,109 +963,34 @@ void ScannerApp::drawSetupOverlay(cv::Mat& frame) {
         gray.convertTo(gray, CV_8U, 1.0 / 256.0);
     }
     
-    // Define region of interest for sprocket detection using user-defined bounds
-    int roiX = leftSprocketEdge;
-    int roiY = centerY - (sprocketDetectHeight / 2);
-    int roiWidth = rightSprocketEdge - leftSprocketEdge;
-    int roiHeight = sprocketDetectHeight;
-    
-    if (roiX < 0 || roiY < 0 || roiX + roiWidth > frame.cols || roiY + roiHeight > frame.rows) {
-        return;
-    }
-    
-    cv::Rect roi(roiX, roiY, roiWidth, roiHeight);
-    cv::Mat roiGray = gray(roi);
-    
-    // Threshold
+    //Crop gray horizontally to leftSprocketEdge and rightSprocketEdge
+    cv::Mat croppedGray = gray(cv::Rect(leftSprocketEdge, 0, rightSprocketEdge - leftSprocketEdge, gray.rows));
+
+    //Threshold
     cv::Mat binary;
-    cv::threshold(roiGray, binary, sprocketBrightnessThreshold_, 255, cv::THRESH_BINARY);
+    cv::threshold(croppedGray, binary, sprocketBrightnessThreshold_, 255, cv::THRESH_BINARY);
     
     // Find contours
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     
     sprocketDetected_ = false;
-    
+
+    // Find the first rectangle that exceeds sprocketMinHeight_
     for (const auto& contour : contours) {
-        double area = cv::contourArea(contour);
-        if (area > 100 && area < 5000) {  // Adjust based on your setup
-            cv::Moments m = cv::moments(contour);
-            if (m.m00 > 0) {
-                int cx = static_cast<int>(m.m10 / m.m00) + roiX;
-                int cy = static_cast<int>(m.m01 / m.m00) + roiY;
-                sprocketCenter_ = cv::Point(cx, cy);
-                sprocketDetected_ = true;
-                break;
-            }
+
+        boundingRect = cv::boundingRect(contour);
+
+        if (boundingRect.height >= sprocketMinHeight_ && boundingRect.height <= sprocketDetectHeight) { //Within the range
+            int cx = boundingRect.x + boundingRect.width / 2 + leftSprocketEdge;    //Move right so slice offset aligns to OG frame
+            int cy = boundingRect.y + boundingRect.height / 2;
+            sprocketCenter_ = cv::Point(cx, cy);
+            sprocketDetected_ = true;
+            break;
+
         }
+
     }
-
-    // Draw frame scan guide
-    cv::Rect frameRect(leftScanEdge, centerY - (verticalScanHeight / 2), 
-                      rightScanEdge - leftScanEdge, verticalScanHeight);
-    cv::rectangle(frame, frameRect, cv::Scalar(0, 255, 255), 8);
-    
-
-    drawText(frame, "SPROCKET DETECTION AREA", 20, centerY - (sprocketDetectHeight / 2) - 20, 1.0);
-
-    cv::line(frame, cv:Point(0, centerY - (sprocketDetectHeight / 2)), 
-             cv::Point(frame.cols, centerY - (sprocketDetectHeight / 2)), 
-             cv::Scalar(255, 255, 255), 2);
-
-    cv::line(frame, cv::Point(0, centerY + (sprocketDetectHeight / 2)), 
-             cv::Point(frame.cols, centerY + (sprocketDetectHeight / 2)), 
-             cv::Scalar(255, 255, 255), 2);
-
-    
-    // Draw detected sprocket
-    if (sprocketDetected_) {
-        cv::circle(frame, sprocketCenter_, 10, cv::Scalar(0, 0, 255), -1);
-        cv::putText(frame, "SPROCKET", cv::Point(sprocketCenter_.x - 40, sprocketCenter_.y - 15),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
-    }
-
-    //Draw vertical lines
-    cv::line(frame, cv::Point(leftSprocketEdge, 0), cv::Point(leftSprocketEdge, frame.rows), 
-             cv::Scalar(0, 0, 255), 8);
-    cv::line(frame, cv::Point(rightSprocketEdge, 0), cv::Point(rightSprocketEdge, frame.rows), 
-             cv::Scalar(255, 0, 0), 8);
-    cv::line(frame, cv::Point(leftScanEdge, 0), cv::Point(leftScanEdge, frame.rows), 
-             cv::Scalar(0, 255, 255), 8);
-    cv::line(frame, cv::Point(rightScanEdge, 0), cv::Point(rightScanEdge, frame.rows), 
-             cv::Scalar(0, 255, 255), 8);
-
-    // Draw overlay specific to setup mode
-    cv::putText(frame, "SETUP", cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 
-                5.0, cv::Scalar(0, 255, 0), 2);
-
-}
-
-void ScannerApp::scanSingleFrame() {
-    if (!scanning_) return;
-    
-    // Capture high-resolution still
-    cv::Mat photo;
-    if (!camera_.capturePhoto(photo)) {
-        std::cerr << "Failed to capture photo" << std::endl;
-        return;
-    }
-    
-    // Process and save
-    std::ostringstream oss;
-    oss << exportFolder_ << "/" << imageFilePrefix_ 
-        << std::setfill('0') << std::setw(5) << frameCount_ << ".png";
-    std::string filename = oss.str();
-    cv::imwrite(filename, photo);
-    
-    frameCount_++;
-    //TODO: REDRAW FRAMES HERE
-    
-    std::cout << "Saved: " << filename << std::endl;
-    
-    // Advance film
-    computeMovePerFrame();
-    //advanceFilm(movePerFrame_, true);
-    
 
 }
 
@@ -930,7 +1016,7 @@ void ScannerApp::advanceFilmTracking(float frames, float speed, bool waitForResp
         float leftover = 0 - movement_mm_turn;          //Save delta past 0
         spool_diameter_mm_ -= (film_thickness_mm * 2);   // Increase the spool diameter by twice the film thickness
         computeMovePerFrame();       // Recompute the movement per frame based on diameter
-        skipFrameTarget = computeSkipFrameTarget(spool_diameter_mm_); // Recompute the skip frame target based on the new spool diameter
+        //skipFrameTarget = computeSkipFrameTarget(spool_diameter_mm_); // Recompute the skip frame target based on the new spool diameter
         movement_mm_turn = movement_mm_turn_target - leftover;    // Reset the movement to the leftover value
         return;
     }
@@ -940,28 +1026,44 @@ void ScannerApp::advanceFilmTracking(float frames, float speed, bool waitForResp
         spool_diameter_mm_ += (film_thickness_mm * 2);   // Increase the spool diameter by twice the film thickness
         computeMovePerFrame();       // Recompute the movement per frame based on diameter
         movement_mm_turn = leftover;    // Reset the movement to the leftover value
-        skipFrameTarget = computeSkipFrameTarget(spool_diameter_mm_); // Recompute the skip frame target based on the new spool diameter
+        //skipFrameTarget = computeSkipFrameTarget(spool_diameter_mm_); // Recompute the skip frame target based on the new spool diameter
 
         std::cout << "Skip frame target: " << skipFrameTarget << " frames" << std::endl;
 
         return;
     }
 
-}
 
-int ScannerApp::computeSkipFrameTarget(float spool_diameter_mm) {
-    return int(0.266f * spool_diameter_mm + 41.5f + 0.5f); // Add 0.5 for rounding
+
 }
 
 // Slot implementations
 void ScannerApp::onStartScan() {
 
+    // Validate export folder is set and exists
+    if (exportFolder_.empty()) {
+        QMessageBox::warning(this, "Export Folder Required", 
+            "Please set an export folder before starting the scan.\n\n"
+            "Click 'Set Export Folder' to choose a location for saved images.");
+        return;
+    }
+    
+    QDir exportDir(QString::fromStdString(exportFolder_));
+    if (!exportDir.exists()) {
+        QMessageBox::warning(this, "Invalid Export Folder", 
+            QString("The export folder does not exist:\n%1\n\n"
+                    "Please select a valid folder.")
+            .arg(QString::fromStdString(exportFolder_)));
+        return;
+    }
+
     saveSetupSettings();
+    camera_.stopVideo();
 
     computeMovePerFrame();
     scanning_ = true;
     currentState_ = SCANNING;
-    frameCount_ = 0;
+    frameCount_ = 0;            //TODO: Don't always reset
     
     scanButton_->setEnabled(false);
     stopButton_->setEnabled(true);
@@ -972,43 +1074,54 @@ void ScannerApp::onStartScan() {
 
 void ScannerApp::onStopScan() {
     scanning_ = false;
-    currentState_ = PREVIEW;
     
     scanButton_->setEnabled(true);
     stopButton_->setEnabled(false);
     
     std::cout << "Scan stopped. Captured " << frameCount_ << " frames." << std::endl;
 
+    onSwitchToPreview();    //Manually back to this
+
 }
 
 void ScannerApp::onSwitchToSetup() {
+
     camera_.stopVideo();
+
+    if (camera_.capturePhoto(frame)) {
+        setupFrame_ = frame.clone();
+        std::cout << "Setup photo captured" << std::endl;
+    } else {
+        std::cerr << "Failed to capture setup photo" << std::endl;
+    }
+    
+    currentState_ = SETUP;
     
     // Give camera time to fully stop, then reconfigure for 4K photos
-    QTimer::singleShot(200, this, [this]() {
+    // QTimer::singleShot(200, this, [this]() {
 
-        std::cout << "Switching to setup mode..." << std::endl;
+    //     std::cout << "Switching to setup mode..." << std::endl;
         
-        // Shutdown and reinitialize for photo mode
-        // camera_.shutdown();
-        // camera_.setVideoResolution(Config::PHOTO_WIDTH, Config::PHOTO_HEIGHT);
-        // camera_.setPhotoResolution(Config::PHOTO_WIDTH, Config::PHOTO_HEIGHT);
+    //     // Shutdown and reinitialize for photo mode
+    //     // camera_.shutdown();
+    //     // camera_.setVideoResolution(Config::PHOTO_WIDTH, Config::PHOTO_HEIGHT);
+    //     // camera_.setPhotoResolution(Config::PHOTO_WIDTH, Config::PHOTO_HEIGHT);
         
-        // if (!camera_.initialize()) {
-        //     statusLabel_->setText("Status: Failed to initialize 4K mode");
-        //     return;
-        // }
+    //     // if (!camera_.initialize()) {
+    //     //     statusLabel_->setText("Status: Failed to initialize 4K mode");
+    //     //     return;
+    //     // }
         
-        // Capture a single photo for setup mode
-        if (camera_.capturePhoto(frame)) {
-            setupFrame_ = frame.clone();
-            std::cout << "Setup photo captured" << std::endl;
-        } else {
-            std::cerr << "Failed to capture setup photo" << std::endl;
-        }
+    //     // Capture a single photo for setup mode
+    //     if (camera_.capturePhoto(frame)) {
+    //         setupFrame_ = frame.clone();
+    //         std::cout << "Setup photo captured" << std::endl;
+    //     } else {
+    //         std::cerr << "Failed to capture setup photo" << std::endl;
+    //     }
         
-        currentState_ = SETUP;
-    });
+    //     currentState_ = SETUP;
+    // });
 
 }
 
@@ -1043,7 +1156,7 @@ void ScannerApp::onFocusToggle() {
     if (currentState_ != PREVIEW) return;
 
     focusZoomedIn_ = !focusZoomedIn_;
-    focusButton_->setText(focusZoomedIn_ ? "Focus On" : "Focus Off");
+    focusButton_->setText(focusZoomedIn_ ? "Focus OFF" : "Focus ON");
 
 }
 
@@ -1051,7 +1164,7 @@ void ScannerApp::onLightToggle() {
     lightOn_ = !lightOn_;
     if (marlin_) {
         marlin_->setLight(lightOn_);
-        lightButton_->setText(lightOn_ ? "Light: ON" : "Light: OFF");
+        lightButton_->setText(lightOn_ ? "Light: OFF" : "Light: ON");
     }
 }
 
@@ -1059,7 +1172,7 @@ void ScannerApp::onFanToggle() {
     fanOn_ = !fanOn_;
     if (marlin_) {
         marlin_->setFan(fanOn_);
-        fanButton_->setText(fanOn_ ? "Fan: ON" : "Fan: OFF");
+        fanButton_->setText(fanOn_ ? "Fan: OFF" : "Fan: ON");
     }
 }
 
@@ -1068,10 +1181,10 @@ void ScannerApp::onMotorsToggle() {
     if (marlin_) {
         if (motorsEnabled_) {
             marlin_->enableMotors();
-            motorsButton_->setText("Motors: ON");
+            motorsButton_->setText("Motors: OFF");
         } else {
             marlin_->disableMotors();
-            motorsButton_->setText("Motors: OFF");
+            motorsButton_->setText("Motors: ON");
         }
     }
 }

@@ -307,6 +307,8 @@ bool PiCamera::getVideoFrame(cv::Mat& frame) {
     return true;
 }
 
+
+
 bool PiCamera::capturePhoto(cv::Mat& image) {
     if (!initialized_) return false;
     
