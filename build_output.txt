@@ -1,0 +1,40 @@
+=========================================
+Super 8 Scanner Build Script
+=========================================
+Creating build directory...
+Running CMake...
+CMake Warning (dev) at CMakeLists.txt:11 (find_package):
+  Policy CMP0167 is not set: The FindBoost module is removed.  Run "cmake
+  --help-policy CMP0167" for policy details.  Use the cmake_policy command to
+  set the policy and suppress this warning.
+
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Using Qt5
+-- Configuring done (0.1s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/ben/scanner/build
+Building application...
+[  0%] Built target scanner_autogen_timestamp_deps
+[ 14%] Built target scanner_autogen
+[ 28%] Linking CXX executable scanner
+/usr/bin/ld: CMakeFiles/scanner.dir/src/MarlinController.cpp.o: in function `MarlinController::advanceFilm2(float, float, float, bool)':
+MarlinController.cpp:(.text+0xb30): undefined reference to `MarlinController::sendAndWait(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)'
+/usr/bin/ld: MarlinController.cpp:(.text+0xb38): undefined reference to `MarlinController::waitForMoveCompletion()'
+/usr/bin/ld: CMakeFiles/scanner.dir/src/main.cpp.o: in function `ScannerApp::onAdvanceFrame()':
+main.cpp:(.text+0x48d0): undefined reference to `ScannerApp::computeMovePerFrame()'
+/usr/bin/ld: main.cpp:(.text+0x48e8): undefined reference to `ScannerApp::advanceFilm(float, bool)'
+/usr/bin/ld: CMakeFiles/scanner.dir/src/main.cpp.o: in function `ScannerApp::onRewindFrame()':
+main.cpp:(.text+0x48fc): undefined reference to `ScannerApp::computeMovePerFrame()'
+/usr/bin/ld: main.cpp:(.text+0x4918): undefined reference to `ScannerApp::advanceFilm(float, bool)'
+/usr/bin/ld: CMakeFiles/scanner.dir/src/main.cpp.o: in function `ScannerApp::scanSingleFrame()':
+main.cpp:(.text+0x4d64): undefined reference to `ScannerApp::computeMovePerFrame()'
+/usr/bin/ld: main.cpp:(.text+0x4d74): undefined reference to `ScannerApp::advanceFilm(float, bool)'
+/usr/bin/ld: CMakeFiles/scanner.dir/src/main.cpp.o: in function `ScannerApp::onStartScan()':
+main.cpp:(.text+0x57bc): undefined reference to `ScannerApp::computeMovePerFrame()'
+/usr/bin/ld: CMakeFiles/scanner.dir/src/main.cpp.o: in function `ScannerApp::initializeHardware()':
+main.cpp:(.text+0x6974): undefined reference to `ScannerApp::computeMovePerFrame()'
+collect2: error: ld returned 1 exit status
+make[2]: *** [CMakeFiles/scanner.dir/build.make:217: scanner] Error 1
+make[1]: *** [CMakeFiles/Makefile2:90: CMakeFiles/scanner.dir/all] Error 2
+make: *** [Makefile:136: all] Error 2
