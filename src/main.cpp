@@ -163,8 +163,8 @@ private:
     void advanceFilmTracking(float frames, float speed, bool waitForResponse = false);
     int computeSkipFrameTarget(float spool_diameter_mm);
     void computeMovePerFrame();
-    void detectSprocket(const cv::Mat& frame);
     void drawPreviewOverlay(cv::Mat& frame);
+    float computeFocusScore(const cv::Mat &image);
     void drawSetupOverlay(cv::Mat& frame);
     void drawScanningOverlay(cv::Mat& frame);
     void scanSingleFrame();
@@ -172,6 +172,8 @@ private:
 
     void saveSetupSettings();
     void loadSetupSettings();
+
+    void drawText(cv::Mat& frame, std::string text, int x, int y, double fontScale = 1.0);
 
 };
 
@@ -611,6 +613,14 @@ void ScannerApp::loadSetupSettings() {
     std::cout << "Settings loaded from: " << filePath.toStdString() << std::endl;
 }
 
+void ScannerApp::drawText(cv::Mat& frame, std::string text, int x, int y, double fontScale) {
+
+    //Draw thick outline, then thinner text on top
+    cv::putText(frame, text, cv::Point(x, y), cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(0, 0, 0), 5);
+    cv::putText(frame, text, cv::Point(x, y), cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(255, 255, 255), 2);
+
+}
+
 void ScannerApp::updateFrame() {
 
     switch(currentState_) {
@@ -649,7 +659,7 @@ void ScannerApp::updateFrame() {
                     displayFrame = displayFrame.clone();
                 }
 
-                detectSprocket(displayFrame);
+                //detectSprocket(displayFrame);
                 drawSetupOverlay(displayFrame);
                 updateVideoDisplay(displayFrame);
 
@@ -690,8 +700,12 @@ void ScannerApp::updateVideoDisplay(const cv::Mat& frame) {
     // Convert to pixmap and scale
     QPixmap pixmap = QPixmap::fromImage(qImage);
 
-    if (focusZoomedIn_ == false) {
+    if (focusZoomedIn_ == false) {          //Scaled to fit window
         pixmap = pixmap.scaled(videoLabel_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    }
+    else {
+        //Leave zoomied in and get the computeFocusScore
+        focusScore = computeFocusScore(frame);
     }
     
     videoLabel_->setPixmap(pixmap);
@@ -709,10 +723,76 @@ void ScannerApp::computeMovePerFrame() {
 
 }
 
-void ScannerApp::detectSprocket(const cv::Mat& frame) {
+void ScannerApp::drawPreviewOverlay(cv::Mat& frame) {
 
     if (frame.empty()) return;
     
+    if (focusZoomedIn_ == true) {        // Display focus score and no crosshairs
+
+        std::ostringstream oss;
+        oss << "Focus Score: " << std::fixed << std::setprecision(2) << focusScore;
+
+        drawText(frame, oss.str(), 375, 340 - 20, 2.0);
+        drawText(frame, "HIGHER IS BETTER", 375, 340 + 20, 1.0);
+
+        return;
+
+    }
+
+    int centerX = frame.cols / 2;
+    int centerY = frame.rows / 2;
+    
+    // Draw center crosshair
+    cv::line(frame, cv::Point(0, centerY), cv::Point(frame.cols, centerY), 
+             cv::Scalar(0, 0, 0), 5);
+    cv::line(frame, cv::Point(centerX, centerY - 250), cv::Point(centerX, centerY + 250), 
+             cv::Scalar(0, 0, 0), 5);
+    cv::line(frame, cv::Point(0, centerY), cv::Point(frame.cols, centerY), 
+             cv::Scalar(255, 255, 255), 2);
+    cv::line(frame, cv::Point(centerX, centerY - 250), cv::Point(centerX, centerY + 250), 
+             cv::Scalar(255, 255, 255), 2);
+        
+    drawText(frame, "PREVIEW", 10, 30, 2);
+
+}
+
+float ScannerApp::computeFocusScore(const cv::Mat &image) {
+    // Extract a strip of pixels from the center of the image
+    int stripHeight = 100; // Height of the strip
+    int centerY = image.rows / 2;
+    cv::Rect centerStrip(0, centerY - stripHeight / 2, image.cols, stripHeight);
+    cv::Mat strip = image(centerStrip);
+
+    // Convert the strip to grayscale if it's not already
+    cv::Mat grayStrip;
+    if (strip.channels() == 3) {
+        cv::cvtColor(strip, grayStrip, cv::COLOR_BGR2GRAY);
+    } else {
+        grayStrip = strip;
+    }
+
+    // Apply the Laplacian operator to detect edges
+    cv::Mat laplacian;
+    cv::Laplacian(grayStrip, laplacian, CV_64F);
+
+    // Compute the variance of the Laplacian
+    cv::Scalar mean, stddev;
+    cv::meanStdDev(laplacian, mean, stddev);
+    double variance = stddev[0] * stddev[0];
+
+    // Return the focus score (lower is better focus)
+    return static_cast<float>(variance);
+
+}
+
+void ScannerApp::drawSetupOverlay(cv::Mat& frame) {
+    
+    if (frame.empty()) {
+        return;
+    }
+
+    int centerY = frame.rows / 2;
+
     // Convert to grayscale
     cv::Mat gray;
     cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
@@ -722,11 +802,11 @@ void ScannerApp::detectSprocket(const cv::Mat& frame) {
         gray.convertTo(gray, CV_8U, 1.0 / 256.0);
     }
     
-    // Define region of interest for sprocket detection
-    int roiX = frame.cols / 2 - 100;
-    int roiY = frame.rows / 2 + Config::SAMPLE_Y_OFFSET - 50;
-    int roiWidth = 200;
-    int roiHeight = 100;
+    // Define region of interest for sprocket detection using user-defined bounds
+    int roiX = leftSprocketEdge;
+    int roiY = centerY - (sprocketDetectHeight / 2);
+    int roiWidth = rightSprocketEdge - leftSprocketEdge;
+    int roiHeight = sprocketDetectHeight;
     
     if (roiX < 0 || roiY < 0 || roiX + roiWidth > frame.cols || roiY + roiHeight > frame.rows) {
         return;
@@ -759,41 +839,22 @@ void ScannerApp::detectSprocket(const cv::Mat& frame) {
         }
     }
 
-}
-
-void ScannerApp::drawPreviewOverlay(cv::Mat& frame) {
-
-    if (frame.empty()) return;
-    
-    int centerX = frame.cols / 2;
-    int centerY = frame.rows / 2;
-    
-    // Draw center crosshair
-    cv::line(frame, cv::Point(0, centerY), cv::Point(frame.cols, centerY), 
-             cv::Scalar(0, 255, 0), 4);
-    cv::line(frame, cv::Point(centerX, centerY - 250), cv::Point(centerX, centerY + 250), 
-             cv::Scalar(0, 255, 0), 4);
-
-    // Status text
-    cv::putText(frame, "PREVIEW", cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 
-                1.0, cv::Scalar(0, 255, 0), 2);
-
-}
-
-void ScannerApp::drawSetupOverlay(cv::Mat& frame) {
-    
-    if (frame.empty()) return;
-
-    int centerY = frame.rows / 2;
-
     // Draw frame scan guide
     cv::Rect frameRect(leftScanEdge, centerY - (verticalScanHeight / 2), 
                       rightScanEdge - leftScanEdge, verticalScanHeight);
     cv::rectangle(frame, frameRect, cv::Scalar(0, 255, 255), 8);
     
-    // Draw sprocket detection area
-    cv::Rect roi(0, centerY - (sprocketDetectHeight / 2), frame.cols, sprocketDetectHeight);
-    cv::rectangle(frame, roi, cv::Scalar(255, 255, 255), 8);
+
+    drawText(frame, "SPROCKET DETECTION AREA", 20, centerY - (sprocketDetectHeight / 2) - 20, 1.0);
+
+    cv::line(frame, cv:Point(0, centerY - (sprocketDetectHeight / 2)), 
+             cv::Point(frame.cols, centerY - (sprocketDetectHeight / 2)), 
+             cv::Scalar(255, 255, 255), 2);
+
+    cv::line(frame, cv::Point(0, centerY + (sprocketDetectHeight / 2)), 
+             cv::Point(frame.cols, centerY + (sprocketDetectHeight / 2)), 
+             cv::Scalar(255, 255, 255), 2);
+
     
     // Draw detected sprocket
     if (sprocketDetected_) {
@@ -846,7 +907,6 @@ void ScannerApp::scanSingleFrame() {
     
 
 }
-
 
 void ScannerApp::advanceFilmTracking(float frames, float speed, bool waitForResponse) {
 
