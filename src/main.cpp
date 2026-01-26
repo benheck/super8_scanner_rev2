@@ -22,6 +22,8 @@
 #include <QFile>
 #include <QStandardPaths>
 #include <QPalette>
+#include <QRadioButton>
+#include <QButtonGroup>
 
 #include <opencv2/opencv.hpp>
 #include <iostream>
@@ -60,6 +62,7 @@ private slots:
     void onFocusToggle();
     void onSelectExportFolder();
     void onSprocketThresholdChanged(int value);
+    void onBitDepthChanged(int id);
     void initializeHardware();
 
 private:
@@ -75,7 +78,7 @@ private:
     bitState photoBitDepth = DEPTH_8BIT;
     bool lightOn_;
     bool fanOn_;
-    bool motorsEnabled_;
+    bool motorsEnabled_ = true;             //Will be enabled when Marlin connects
     int frameCount_;
     std::string exportFolder_;
     std::string imageFilePrefix_ = "image_";     //Prefix for saved image files ie "old_cars" + .png
@@ -98,8 +101,6 @@ private:
     int leftScanEdge = 900;
     int rightScanEdge = 3000;
     int verticalScanHeight = 1500;
-
-
 
     float film_thickness_mm = 0.15f;        // Film thickness per wrap
     float super8frameHeight = 4.234f;
@@ -126,8 +127,9 @@ private:
     QPushButton* setupButton_ = new QPushButton("Setup Mode");
     QPushButton* scanButton_ = new QPushButton("Start Scan");
     QPushButton* stopButton_ = new QPushButton("Stop Scan");
-    QPushButton* switch8bitDepthButton_ = new QPushButton("8-bit Depth");
-    QPushButton* switch16bitDepthButton_ = new QPushButton("16-bit Depth");
+    QRadioButton* radio8bitDepth_;
+    QRadioButton* radio16bitDepth_;
+    QButtonGroup* bitDepthGroup_;
 
     QPushButton* setSpoolDiameterButton = new QPushButton("Set Spool Diameter");
     QPushButton* setSkipTakeupFrameButton = new QPushButton("Set Skip Takeup Frames");
@@ -354,6 +356,19 @@ void ScannerApp::initializeUI() {
     rightLayout->addWidget(setupButton_, 2, 1); 
     rightLayout->addWidget(scanButton_, 3, 1);
     rightLayout->addWidget(stopButton_, 4, 1);
+    
+    // Bit depth radio buttons
+    rightLayout->addWidget(createLabel("Bit Depth:"), 9, 1);
+    radio8bitDepth_ = new QRadioButton("8-bit");
+    radio16bitDepth_ = new QRadioButton("16-bit");
+    bitDepthGroup_ = new QButtonGroup(this);
+    bitDepthGroup_->addButton(radio8bitDepth_, DEPTH_8BIT);
+    bitDepthGroup_->addButton(radio16bitDepth_, DEPTH_16BIT);
+    radio8bitDepth_->setChecked(true);  // Default to 8-bit
+    radio8bitDepth_->setStyleSheet("color: white; font-size: 14px; padding: 5px;");
+    radio16bitDepth_->setStyleSheet("color: white; font-size: 14px; padding: 5px;");
+    rightLayout->addWidget(radio8bitDepth_, 10, 1);
+    rightLayout->addWidget(radio16bitDepth_, 11, 1);
 
     // Export folder
     rightLayout->addWidget(createLabel("Image Filename Prefix:"), 5, 1);      //The label
@@ -500,6 +515,9 @@ void ScannerApp::connectSignals() {
     });
 
     connect(exportFolderButton_, &QPushButton::clicked, this, &ScannerApp::onSelectExportFolder);
+    
+    // Bit depth radio button connection
+    connect(bitDepthGroup_, &QButtonGroup::idClicked, this, &ScannerApp::onBitDepthChanged);
 
     updateTimer_ = new QTimer(this);
 
@@ -548,7 +566,7 @@ void ScannerApp::initializeHardware() {
     // Start update timer immediately
     computeMovePerFrame();
     std::cout << "Starting update timer..." << std::endl;
-    updateTimer_->start(16);  // ~60 FPS update
+    updateTimer_->start(33);  // ~30 FPS update
     std::cout << "Camera initialization complete!" << std::endl;
 
     // Initialize Marlin controller
@@ -565,6 +583,7 @@ void ScannerApp::initializeHardware() {
     }
     
     initializationComplete_ = true;
+
 }
 
 void ScannerApp::saveSetupSettings() {
@@ -583,6 +602,7 @@ void ScannerApp::saveSetupSettings() {
     QString filePath = "scanner_settings.json";
     
     QFile file(filePath);
+
     if (file.open(QIODevice::WriteOnly)) {
         file.write(doc.toJson());
         file.close();
@@ -590,6 +610,7 @@ void ScannerApp::saveSetupSettings() {
     } else {
         std::cerr << "Failed to save settings to: " << filePath.toStdString() << std::endl;
     }
+
 }
 
 void ScannerApp::loadSetupSettings() {
@@ -1097,32 +1118,6 @@ void ScannerApp::onSwitchToSetup() {
     
     currentState_ = SETUP;
     
-    // Give camera time to fully stop, then reconfigure for 4K photos
-    // QTimer::singleShot(200, this, [this]() {
-
-    //     std::cout << "Switching to setup mode..." << std::endl;
-        
-    //     // Shutdown and reinitialize for photo mode
-    //     // camera_.shutdown();
-    //     // camera_.setVideoResolution(Config::PHOTO_WIDTH, Config::PHOTO_HEIGHT);
-    //     // camera_.setPhotoResolution(Config::PHOTO_WIDTH, Config::PHOTO_HEIGHT);
-        
-    //     // if (!camera_.initialize()) {
-    //     //     statusLabel_->setText("Status: Failed to initialize 4K mode");
-    //     //     return;
-    //     // }
-        
-    //     // Capture a single photo for setup mode
-    //     if (camera_.capturePhoto(frame)) {
-    //         setupFrame_ = frame.clone();
-    //         std::cout << "Setup photo captured" << std::endl;
-    //     } else {
-    //         std::cerr << "Failed to capture setup photo" << std::endl;
-    //     }
-        
-    //     currentState_ = SETUP;
-    // });
-
 }
 
 void ScannerApp::onSwitchToPreview() {
@@ -1130,17 +1125,7 @@ void ScannerApp::onSwitchToPreview() {
     saveSetupSettings();
 
     std::cout << "Switching to preview mode..." << std::endl;
-    
-    // Shutdown and reinitialize for video mode
-    // camera_.shutdown();
-    // camera_.setVideoResolution(Config::VIDEO_WIDTH, Config::VIDEO_HEIGHT);
-    // camera_.setPhotoResolution(Config::PHOTO_WIDTH, Config::PHOTO_HEIGHT);
-    
-    // if (!camera_.initialize()) {
-    //     statusLabel_->setText("Status: Failed to initialize video mode");
-    //     return;
-    // }
-    
+
     if (!camera_.startVideo()) {
         std::cerr << "Failed to start video stream" << std::endl;
         return;
@@ -1177,16 +1162,20 @@ void ScannerApp::onFanToggle() {
 }
 
 void ScannerApp::onMotorsToggle() {
-    motorsEnabled_ = !motorsEnabled_;
+
     if (marlin_) {
+
+        motorsEnabled_ = !motorsEnabled_;
+
         if (motorsEnabled_) {
             marlin_->enableMotors();
-            motorsButton_->setText("Motors: OFF");
+            motorsButton_->setText("Motors: OFF");  //What pressing button again will do
         } else {
             marlin_->disableMotors();
             motorsButton_->setText("Motors: ON");
         }
     }
+
 }
 
 void ScannerApp::onSelectExportFolder() {
@@ -1194,15 +1183,37 @@ void ScannerApp::onSelectExportFolder() {
                                                          QFileDialog::DontUseNativeDialog);
     if (!folder.isEmpty()) {
         exportFolder_ = folder.toStdString();
-        QMessageBox::information(this, "Export Folder", 
-            QString("Export folder set to:\n%1").arg(folder));
     }
+    else {
+        QMessageBox::information(this, "ERROR", 
+            QString("Invalid export folder selected"));        
+    }
+
 }
 
 void ScannerApp::onSprocketThresholdChanged(int value) {
     sprocketBrightnessThreshold_ = value;
 }
 
+void ScannerApp::onBitDepthChanged(int id) {
+    
+    if (currentState_ != PREVIEW) {
+        QMessageBox::warning(this, "Bit Depth Change Not Allowed", 
+            "Bit depth can only be changed in Preview mode.");
+        return;
+    }
+    
+    camera_.stopVideo();   //Stop video to change settings
+    camera_.setPhotoBitDepth(id == DEPTH_8BIT ? 8 : 16);
+    camera_.setVideoBitDepth(id == DEPTH_8BIT ? 8 : 16);
+    camera_.startVideo();  //Restart video stream 
+      
+    photoBitDepth = static_cast<bitState>(id);
+    std::cout << "Photo bit depth set to: " << (id == DEPTH_8BIT ? "8-bit" : "16-bit") << std::endl;
+
+}
+
+//Main entry point
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     
@@ -1221,6 +1232,7 @@ int main(int argc, char* argv[]) {
     scanner.show();
     
     return app.exec();
+
 }
 
 #include "main.moc"

@@ -18,11 +18,13 @@ public:
     void shutdown();
 
     // Video mode
+    bool setVideoBitDepth(int bitDepth);
     bool startVideo();
     bool stopVideo();
     bool getVideoFrame(cv::Mat& frame);
 
     // Photo mode
+    bool setPhotoBitDepth(int bitDepth);
     bool capturePhoto(cv::Mat& image);
 
     // Configuration
@@ -58,6 +60,9 @@ private:
     int videoFps_ = 30;
     unsigned int videoStride_ = 0;
     
+    std::string videoBitDepth = "RGB888";
+    std::string photoBitDepth = "RGB888";
+
     // Photo settings
     int photoWidth_ = 4056;
     int photoHeight_ = 3040;

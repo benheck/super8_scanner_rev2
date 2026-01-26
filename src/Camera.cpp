@@ -75,6 +75,7 @@ void PiCamera::shutdown() {
 }
 
 bool PiCamera::startVideo() {
+
     if (!initialized_) {
         std::cerr << "Camera not initialized" << std::endl;
         return false;
@@ -99,25 +100,28 @@ bool PiCamera::startVideo() {
     StreamConfiguration& streamConfig = videoConfig_->at(0);
     streamConfig.size.width = videoWidth_;
     streamConfig.size.height = videoHeight_;
-    // RGB161616 - 16-bit per channel RGB for higher color depth
-    streamConfig.pixelFormat = PixelFormat::fromString("RGB161616");
-    
-    std::cout << "Requested format: RGB161616" << std::endl;
+    // RGB888 - 8-bit per channel RGB for better performance
+    streamConfig.pixelFormat = PixelFormat::fromString(videoBitDepth);
+
+    std::cout << "Requested format: " << videoBitDepth << std::endl;
     std::cout << "Requested size: " << videoWidth_ << "x" << videoHeight_ << std::endl;
     
     // Validate configuration
     std::cout << "Validating configuration..." << std::endl;
     CameraConfiguration::Status validation = videoConfig_->validate();
+
     if (validation == CameraConfiguration::Invalid) {
         std::cerr << "Video configuration invalid" << std::endl;
         return false;
     }
+
     if (validation == CameraConfiguration::Adjusted) {
         std::cout << "Video configuration adjusted" << std::endl;
     }
     
     // Apply configuration
     std::cout << "Applying configuration..." << std::endl;
+
     if (camera_->configure(videoConfig_.get())) {
         std::cerr << "Failed to configure camera for video" << std::endl;
         return false;
@@ -199,7 +203,23 @@ bool PiCamera::startVideo() {
     return true;
 }
 
+bool PiCamera::setVideoBitDepth(int bitDepth) {
+
+    if (bitDepth == 8) {
+        videoBitDepth = "RGB888";
+    } else if (bitDepth == 16) {
+        videoBitDepth = "RGB161616";
+    } else {
+        std::cerr << "Unsupported video bit depth: " << bitDepth << std::endl;
+        return false;
+    }
+
+    return true;
+
+}
+
 bool PiCamera::stopVideo() {
+
     if (!videoRunning_) return true;
     
     camera_->stop();
@@ -226,6 +246,7 @@ bool PiCamera::stopVideo() {
 }
 
 void PiCamera::videoRequestComplete(Request* request) {
+
     if (request->status() == Request::RequestCancelled) {
         return;
     }
@@ -254,17 +275,22 @@ void PiCamera::videoRequestComplete(Request* request) {
         cv::Mat bgrImage;
         
         try {
-            // XRGB8888 is 4 bytes per pixel - ISP processed
-            cv::Mat xrgbImage(videoHeight_, videoWidth_, CV_8UC4, memory);
-            
-            // RGB161616 is 6 bytes per pixel (16-bit R, G, B)
-            cv::Mat rgb16Image(videoHeight_, videoWidth_, CV_16UC3, memory);
-            
-            // Convert to 8-bit BGR for display
-            rgb16Image.convertTo(bgrImage, CV_8UC3, 1.0/256.0);  // Scale down to 8-bit
-            cv::cvtColor(bgrImage, bgrImage, cv::COLOR_RGB2BGR);
+            if (videoBitDepth == "RGB161616") {
+                // RGB161616 is 6 bytes per pixel (16-bit R, G, B)
+                cv::Mat rgb16Image(videoHeight_, videoWidth_, CV_16UC3, memory);
+                
+                // Convert to 8-bit BGR for display
+                rgb16Image.convertTo(bgrImage, CV_8UC3, 1.0/256.0);  // Scale down to 8-bit
+                cv::cvtColor(bgrImage, bgrImage, cv::COLOR_RGB2BGR);
+            } else {
+                // RGB888 is 3 bytes per pixel (8-bit R, G, B)
+                cv::Mat rgb8Image(videoHeight_, videoWidth_, CV_8UC3, memory);
+                
+                // Convert RGB to BGR for display (no bit depth conversion needed)
+                cv::cvtColor(rgb8Image, bgrImage, cv::COLOR_RGB2BGR);
+            }
         } catch (const cv::Exception& e) {
-            std::cerr << "RGB161616 conversion error: " << e.what() << std::endl;
+            std::cerr << "Video conversion error: " << e.what() << std::endl;
             munmap(memory, plane.length);
             continue;
         }
@@ -284,6 +310,7 @@ void PiCamera::videoRequestComplete(Request* request) {
     // Requeue the request
     request->reuse(Request::ReuseBuffers);
     camera_->queueRequest(request);
+
 }
 
 bool PiCamera::getVideoFrame(cv::Mat& frame) {
@@ -307,19 +334,35 @@ bool PiCamera::getVideoFrame(cv::Mat& frame) {
     return true;
 }
 
+bool PiCamera::setPhotoBitDepth(int bitDepth) {
 
+    if (bitDepth == 8) {
+        photoBitDepth = "RGB888";
+    } else if (bitDepth == 16) {
+        photoBitDepth = "SRGGB10"; //"RGB161616";
+    } else {
+        std::cerr << "Unsupported photo bit depth: " << bitDepth << std::endl;
+        return false;
+    }
+
+    return true;
+
+}
 
 bool PiCamera::capturePhoto(cv::Mat& image) {
+
     if (!initialized_) return false;
     
     // Stop video if running
     bool wasRunning = videoRunning_;
+
     if (wasRunning) {
         stopVideo();
     }
     
     // Generate photo configuration
     auto photoConfig = camera_->generateConfiguration({StreamRole::StillCapture});
+
     if (!photoConfig) {
         std::cerr << "Failed to generate photo configuration" << std::endl;
         return false;
@@ -329,10 +372,11 @@ bool PiCamera::capturePhoto(cv::Mat& image) {
     StreamConfiguration& streamConfig = photoConfig->at(0);
     streamConfig.size.width = photoWidth_;
     streamConfig.size.height = photoHeight_;
-    streamConfig.pixelFormat = PixelFormat::fromString("RGB161616");
+    streamConfig.pixelFormat = PixelFormat::fromString(photoBitDepth);
     
     // Validate and apply
     photoConfig->validate();
+
     if (camera_->configure(photoConfig.get())) {
         std::cerr << "Failed to configure camera for photo" << std::endl;
         return false;
@@ -351,9 +395,11 @@ bool PiCamera::capturePhoto(cv::Mat& image) {
     
     // Set controls (same as video)
     ControlList& controls = request->controls();
+
     if (whiteBalanceMode_ == "auto") {
         controls.set(controls::AwbEnable, true);
-    } else {
+    }
+    else {
         controls.set(controls::AwbEnable, false);
         if (whiteBalanceMode_ == "incandescent") {
             controls.set(controls::ColourGains, libcamera::Span<const float, 2>({1.5f, 1.0f}));
@@ -393,14 +439,17 @@ bool PiCamera::capturePhoto(cv::Mat& image) {
     }
     
     return photoReady_;
+
 }
 
 void PiCamera::photoRequestComplete(Request* request) {
+
     if (request->status() != Request::RequestComplete) {
         return;
     }
     
     const Request::BufferMap& buffers = request->buffers();
+
     for (auto bufferPair : buffers) {
         FrameBuffer* buffer = bufferPair.second;
         const FrameBuffer::Plane& plane = buffer->planes()[0];
@@ -411,9 +460,24 @@ void PiCamera::photoRequestComplete(Request* request) {
             const StreamConfiguration& cfg = request->buffers().begin()->first->configuration();
             size_t stride = cfg.stride;
             
-            // Create Mat with proper stride
-            cv::Mat rgb16Image(photoHeight_, photoWidth_, CV_16UC3, memory, stride);
-            cv::cvtColor(rgb16Image, capturedPhoto_, cv::COLOR_RGB2BGR);
+            // Process based on bit depth
+            if (photoBitDepth == "SRGGB10") {
+                // RAW 10-bit Bayer format - need to debayer
+                // SRGGB10 is packed 10-bit, but we'll treat it as 16-bit for OpenCV
+                cv::Mat rawImage(photoHeight_, photoWidth_, CV_16UC1, memory, stride);
+                
+                // Debayer using RG Bayer pattern to BGR
+                cv::cvtColor(rawImage, capturedPhoto_, cv::COLOR_BayerRG2BGR);
+            } else if (photoBitDepth == "RGB161616") {
+                // 16-bit RGB processing
+                cv::Mat rgb16Image(photoHeight_, photoWidth_, CV_16UC3, memory, stride);
+                cv::cvtColor(rgb16Image, capturedPhoto_, cv::COLOR_RGB2BGR);
+            } else {
+                // 8-bit processing (RGB888)
+                cv::Mat rgb8Image(photoHeight_, photoWidth_, CV_8UC3, memory, stride);
+                cv::cvtColor(rgb8Image, capturedPhoto_, cv::COLOR_RGB2BGR);
+            }
+            
             munmap(memory, plane.length);
             
             std::lock_guard<std::mutex> lock(photoMutex_);
@@ -421,6 +485,7 @@ void PiCamera::photoRequestComplete(Request* request) {
             photoCV_.notify_one();
         }
     }
+
 }
 
 // Configuration methods
