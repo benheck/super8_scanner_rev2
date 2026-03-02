@@ -119,7 +119,7 @@ void MarlinController::waitForOk(int timeout_ms) {
             
             // Start async read
             boost::asio::async_read_until(*serialPort_, responseBuffer, "\n",
-                [&](const boost::system::error_code& error, std::size_t bytes) {
+                [&](const boost::system::error_code& error, std::size_t) {
                     ec = error;
                     dataRead = true;
                     timer.cancel();
@@ -231,4 +231,61 @@ void MarlinController::waitForMoveCompletion() {
     // Send M400 to wait for all moves to complete
     sendGcode("M400");
     waitForOk();
+}
+
+bool MarlinController::checkForOK() {
+    if (!connected_ || !serialPort_ || !serialPort_->is_open()) {
+        return false;
+    }
+    
+    try {
+        boost::asio::streambuf responseBuffer;
+        boost::asio::deadline_timer timer(*ioService_);
+        timer.expires_from_now(boost::posix_time::milliseconds(1)); // Very short timeout
+        
+        boost::system::error_code ec;
+        bool dataRead = false;
+        
+        // Start async read
+        boost::asio::async_read_until(*serialPort_, responseBuffer, "\n",
+            [&](const boost::system::error_code& error, std::size_t) {
+                ec = error;
+                dataRead = true;
+                timer.cancel();
+            });
+        
+        // Start timer
+        timer.async_wait([&](const boost::system::error_code& error) {
+            if (!error) {
+                serialPort_->cancel();
+            }
+        });
+        
+        // Run the IO service
+        ioService_->reset();
+        ioService_->run();
+        
+        if (dataRead && !ec) {
+            std::istream responseStream(&responseBuffer);
+            std::string response;
+            std::getline(responseStream, response);
+            
+            // Remove carriage return if present
+            if (!response.empty() && response.back() == '\r') {
+                response.pop_back();
+            }
+            
+            std::lock_guard<std::mutex> lock(mutex_);
+            lastResponse_ = response;
+            
+            std::cout << "Response: " << response << std::endl;
+            
+            return response.find("ok") != std::string::npos;
+        }
+        
+        return false;
+    } catch (const std::exception &e) {
+        // No data available or error reading
+        return false;
+    }
 }

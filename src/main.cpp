@@ -63,6 +63,8 @@ private slots:
     void onSelectExportFolder();
     void onSprocketThresholdChanged(int value);
     void onBitDepthChanged(int id);
+    void onRewindStart();
+    void onRewindStop();
     void initializeHardware();
 
 private:
@@ -75,10 +77,13 @@ private:
     // State
     State currentState_;
     bool scanning_;
+    bool waitingForMoveCompletion_;
+    std::chrono::high_resolution_clock::time_point moveCompletionStartTime_;
     bitState photoBitDepth = DEPTH_8BIT;
     bool lightOn_;
     bool fanOn_;
     bool motorsEnabled_ = true;             //Will be enabled when Marlin connects
+    bool rewinding_ = false;                //Track if rewinding is active
     int frameCount_;
     std::string exportFolder_;
     std::string imageFilePrefix_ = "image_";     //Prefix for saved image files ie "old_cars" + .png
@@ -98,6 +103,8 @@ private:
     int leftSprocketEdge = 500;
     int rightSprocketEdge = 750;
     int sprocketDetectHeight = 1000;
+    int sprocketDetectHeightTemp = 700;
+    bool reacquireSprocket = false;
     int leftScanEdge = 900;
     int rightScanEdge = 3000;
     int verticalScanHeight = 1500;
@@ -115,6 +122,7 @@ private:
     bool stopScanFlag = false; // Flag to indicate if the scan should be stopped
     int skipFrameCount = 0;
     int skipFrameTarget = 50;
+    std::chrono::high_resolution_clock::time_point lastSaveTime;
 
 
 
@@ -142,6 +150,9 @@ private:
     QPushButton* advance10Button = new QPushButton("<< Frame +10");
     QPushButton* advance50Button = new QPushButton("<< Frame +50");
     QPushButton* advance100Button = new QPushButton("<< Frame +100");
+
+    QPushButton* rewindButton = new QPushButton("Rewind Spool");
+    QPushButton* rewindStopButton = new QPushButton("Stop Rewind");
 
     QPushButton* lightButton_ = new QPushButton("Light: ON");
     QPushButton* fanButton_ = new QPushButton("Fan: ON");
@@ -197,6 +208,7 @@ ScannerApp::ScannerApp(QWidget* parent)
       initializationComplete_(false),
       currentState_(PREVIEW),
       scanning_(false),
+      waitingForMoveCompletion_(false),
       lightOn_(false),
       fanOn_(false),
       motorsEnabled_(false),
@@ -252,7 +264,7 @@ void ScannerApp::initializeUI() {
     //Sprocket and scan edge sliders UNDER VIDEO WINDOW
     adjustmentLayout->addWidget(createLabel("SPROCKET BRIGHTNESS THRESHOLD"), 0, 0);
     sprocketBrightSlider_ = new QSlider(Qt::Horizontal);
-    sprocketBrightSlider_->setRange(0, 100);
+    sprocketBrightSlider_->setRange(0, 255);
     sprocketBrightSlider_->setValue(sprocketBrightnessThreshold_);
     sprocketBrightSlider_->setStyleSheet("padding: 5px;");
     adjustmentLayout->addWidget(sprocketBrightSlider_, 1, 0);
@@ -346,6 +358,9 @@ void ScannerApp::initializeUI() {
     rightLayout->addWidget(advance10Button, 15, 0);
     rightLayout->addWidget(advance50Button, 16, 0);
     rightLayout->addWidget(advance100Button, 17, 0);
+    rightLayout->addWidget(rewindButton, 18, 0);
+    rightLayout->addWidget(rewindStopButton, 19, 0);
+    rewindStopButton->setEnabled(false);  // Initially disabled
 
 
     //RIGHT COLUMN CONTROLS----------------------
@@ -387,6 +402,9 @@ void ScannerApp::initializeUI() {
 void ScannerApp::connectSignals() {
 
     // Connect all the other sliders with validation
+    connect(sprocketBrightSlider_, &QSlider::valueChanged, [this](int value) {
+        sprocketBrightnessThreshold_ = value;
+    });
     connect(sprocketHeightSlider_, &QSlider::valueChanged, [this](int value) {
         sprocketMinHeight_ = value;
     });
@@ -499,6 +517,9 @@ void ScannerApp::connectSignals() {
     connect(advance100Button, &QPushButton::clicked, [this]() {
         advanceFilmTracking(100.0f, 3000.0f); // Move the film forward by one frame
     });
+
+    connect(rewindButton, &QPushButton::clicked, this, &ScannerApp::onRewindStart);
+    connect(rewindStopButton, &QPushButton::clicked, this, &ScannerApp::onRewindStop);
 
     connect(scanButton_, &QPushButton::clicked, this, &ScannerApp::onStartScan);
     connect(stopButton_, &QPushButton::clicked, this, &ScannerApp::onStopScan);
@@ -717,7 +738,28 @@ void ScannerApp::updateFrame() {
             break;
 
         case SCANNING:
-            scanSingleFrame();
+            if (waitingForMoveCompletion_) {
+                // Check if move is complete without blocking
+                if (marlin_ && marlin_->checkForOK()) {
+                    std::cout << "Move completed, ready for next frame" << std::endl;
+                    waitingForMoveCompletion_ = false;
+                    // Process events to keep UI responsive
+                    QApplication::processEvents();
+                } else {
+                    // Check for timeout (10 seconds)
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::high_resolution_clock::now() - moveCompletionStartTime_);
+                    if (elapsed.count() > 10000) {
+                        std::cerr << "WARNING: Move completion timeout after " << elapsed.count() 
+                                  << "ms - continuing anyway" << std::endl;
+                        waitingForMoveCompletion_ = false;
+                    }
+                }
+                // Still waiting, don't capture next frame yet
+            } else if (scanning_) {
+                // Ready to capture next frame
+                scanSingleFrame();
+            }
             break;
 
     }
@@ -840,8 +882,8 @@ void ScannerApp::drawSetupOverlay(cv::Mat& frame) {
         centerY = sprocketCenter_.y;    //Vert ref lines based on sprocket center, NOT screen center
 
         cv::rectangle(frame, 
-                      cv::Point(boundingRect.x + leftSprocketEdge, boundingRect.y),
-                      cv::Point(boundingRect.x + leftSprocketEdge + boundingRect.width, boundingRect.y + boundingRect.height),
+                      cv::Point(boundingRect.x, boundingRect.y),
+                      cv::Point(boundingRect.x + boundingRect.width, boundingRect.y + boundingRect.height),
                       cv::Scalar(255, 0, 255), 8);
 
         drawText(frame, "FOUND", 20, boundingRect.y + 25 + boundingRect.height / 2, 5.0);
@@ -886,6 +928,12 @@ void ScannerApp::drawSetupOverlay(cv::Mat& frame) {
                       rightScanEdge - leftScanEdge, verticalScanHeight);
     cv::rectangle(frame, frameRect, cv::Scalar(0, 255, 255), 8);
 
+    // Draw a frame the height of the screen, from rightScanEdge to rightScanEdge + 20:
+    cv::rectangle(frame, 
+                  cv::Point(rightScanEdge, 0),
+                  cv::Point(rightScanEdge + 50, frame.rows),
+                  cv::Scalar(255, 0, 255), 8);
+
     // Draw overlay specific to setup mode
     drawText(frame, "SETUP", 20, 200, 5);
 
@@ -894,7 +942,12 @@ void ScannerApp::drawSetupOverlay(cv::Mat& frame) {
 void ScannerApp::scanSingleFrame() {
 
     if (!scanning_) return;
-    
+
+    if (!camera_.capturePhoto(scannedFrame_)) {
+        std::cerr << "Failed to capture photo" << std::endl;
+        return;
+    }
+
     if (!camera_.capturePhoto(scannedFrame_)) {
         std::cerr << "Failed to capture photo" << std::endl;
         return;
@@ -916,28 +969,93 @@ void ScannerApp::scanSingleFrame() {
         cv::Rect frameRect(leftScanEdge, centerY - (verticalScanHeight / 2), 
                           rightScanEdge - leftScanEdge, verticalScanHeight);
 
+        // Validate rectangle is within image bounds
+        if (frameRect.x < 0 || frameRect.y < 0 ||
+            frameRect.x + frameRect.width > scannedFrame_.cols ||
+            frameRect.y + frameRect.height > scannedFrame_.rows) {
+            std::cerr << "Frame rectangle out of bounds - skipping frame. "
+                      << "Rect: x=" << frameRect.x << " y=" << frameRect.y 
+                      << " w=" << frameRect.width << " h=" << frameRect.height
+                      << " Image: " << scannedFrame_.cols << "x" << scannedFrame_.rows << std::endl;
+            advanceFilmTracking(1.0f, 3000.0f);
+            return;
+        }
+
         croppedFrame = scannedFrame_(frameRect).clone(); //Clone to ensure continuous memory
 
         //Draw rectangle on scannedFrame_ for display (not export)
         cv::rectangle(scannedFrame_, 
-                      cv::Point(boundingRect.x + leftSprocketEdge, boundingRect.y),
-                      cv::Point(boundingRect.x + leftSprocketEdge + boundingRect.width, boundingRect.y + boundingRect.height),
-                      cv::Scalar(255, 255, 255), 8);
+                      cv::Point(boundingRect.x, boundingRect.y),
+                      cv::Point(boundingRect.x + boundingRect.width, boundingRect.y + boundingRect.height),
+                      cv::Scalar(255, 0, 0), 10);
      
     }
     else {
         // No sprocket detected - skip this frame
-        std::cerr << "Sprocket not detected, skipping frame" << std::endl;
-        advanceFilmTracking(1.0f, 3000.0f);
+        std::cerr << "Sprocket not detected, nudging..." << std::endl;
+
+        reacquireSprocket = true;   //Try to reacquire next frame
+        advanceFilmTracking(0.1f, 500.0f);  //Slow small move, until sprockets found again
+
+        // Convert to 8-bit if needed before sending to display
+        if (scannedFrame_.depth() == CV_16U) {
+            scannedFrame_.convertTo(scannedFrame_, CV_8U, 1.0 / 256.0);
+        }
+
+        int centerY = scannedFrame_.rows / 2;
+
+        drawText(scannedFrame_, "SPROCKET DETECTION AREA", 20, centerY - (sprocketDetectHeightTemp / 2) - 25, 1.5);
+        cv::line(scannedFrame_, cv::Point(0, centerY - (sprocketDetectHeightTemp / 2)), 
+                cv::Point(rightSprocketEdge, centerY - (sprocketDetectHeightTemp / 2)), 
+                cv::Scalar(255, 0, 0), 2);
+        cv::line(scannedFrame_, cv::Point(0, centerY + (sprocketDetectHeightTemp / 2)), 
+                cv::Point(rightSprocketEdge, centerY + (sprocketDetectHeightTemp / 2)), 
+                cv::Scalar(255, 0, 0), 2);
+        
+        //Check rightScanEdge to rightScanEdge + 50 area, from y0 to frame.rows, and if it ISN'T black, stop the scan:
+        cv::Rect rightEdgeRect(rightScanEdge, 0, 50, scannedFrame_.rows);
+        cv::Mat rightEdgeArea = scannedFrame_(rightEdgeRect);
+
+        cv::Mat grayRightEdge;
+        cv::cvtColor(rightEdgeArea, grayRightEdge, cv::COLOR_BGR2GRAY);
+        cv::Scalar meanBrightness = cv::mean(grayRightEdge);
+        double avgVal = meanBrightness[0];
+
+        if (avgVal > 128) { //If average brightness is high, we hit the end of the film
+            std::cout << "End of film detected, stopping scan." << std::endl;
+            onStopScan();
+            QMessageBox::information(this, "Scan Complete", 
+                "End of film detected. Scan stopped automatically.");
+        }
+
+        //Draw a white rectangle around the area being checked:
+        cv::rectangle(scannedFrame_, 
+                      cv::Point(rightScanEdge, 0),
+                      cv::Point(rightScanEdge + 50, scannedFrame_.rows),
+                      cv::Scalar(255, 255, 255), 8);
+
+        // Update display
+        updateVideoDisplay(scannedFrame_);
+        
+        // Force UI to update
+        QApplication::processEvents();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+
+        
         return;
     }
     
     // Validate cropped frame before saving
     if (croppedFrame.empty()) {
         std::cerr << "Cropped frame is empty, skipping" << std::endl;
-        advanceFilmTracking(1.0f, 3000.0f);
+        advanceFilmTracking(0.1f, 3000.0f);
         return;
     }
+
+    // Advance film before we start the save
+    advanceFilmTracking(1.0f, 3000.0f, true);
     
     // Process and save
     std::ostringstream oss;
@@ -950,6 +1068,14 @@ void ScannerApp::scanSingleFrame() {
     cv::cvtColor(croppedFrame, rgbFrame, cv::COLOR_BGR2RGB);
     cv::imwrite(filename, rgbFrame);
     
+    // Calculate time since last save
+    auto currentSaveTime = std::chrono::high_resolution_clock::now();
+    if (frameCount_ > 0) {
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(currentSaveTime - lastSaveTime);
+        std::cout << "Time since last save: " << duration.count() << " ms" << std::endl;
+    }
+    lastSaveTime = currentSaveTime;
+    
     frameCount_++;
 
     // Convert to 8-bit if needed before sending to display
@@ -960,11 +1086,18 @@ void ScannerApp::scanSingleFrame() {
     // Update display
     updateVideoDisplay(scannedFrame_);
     
-    // Advance film
-    advanceFilmTracking(1.0f, 3000.0f); // Move the film forward by one frame
-
-
-
+    // Force UI to update
+    QApplication::processEvents();
+ 
+    // Send M400 to check that move completed during our save
+    if (marlin_) {
+        marlin_->sendGcode("M400");
+        waitingForMoveCompletion_ = true;
+        moveCompletionStartTime_ = std::chrono::high_resolution_clock::now();
+    }
+    
+    // Note: We'll check for completion in updateFrame() next cycle
+    // This keeps the UI responsive during the move
 
 }
 
@@ -984,8 +1117,20 @@ void ScannerApp::findSprocket(const cv::Mat& frame) {
         gray.convertTo(gray, CV_8U, 1.0 / 256.0);
     }
     
-    //Crop gray horizontally to leftSprocketEdge and rightSprocketEdge
-    cv::Mat croppedGray = gray(cv::Rect(leftSprocketEdge, 0, rightSprocketEdge - leftSprocketEdge, gray.rows));
+    int centerY = gray.rows / 2;
+    sprocketDetectHeightTemp = sprocketDetectHeight;
+
+    if (reacquireSprocket) {
+        sprocketDetectHeightTemp = (int)(sprocketDetectHeightTemp * .7); //Make detection zone smaller to reacquire
+    }
+
+    int detectTop = centerY - (sprocketDetectHeightTemp / 2);
+    int detectBottom = centerY + (sprocketDetectHeightTemp / 2);
+
+    //Crop gray both horizontally and vertically to detection zone
+    cv::Mat croppedGray = gray(cv::Rect(leftSprocketEdge, detectTop, 
+                                        rightSprocketEdge - leftSprocketEdge, 
+                                        detectBottom - detectTop));
 
     //Threshold
     cv::Mat binary;
@@ -1002,11 +1147,18 @@ void ScannerApp::findSprocket(const cv::Mat& frame) {
 
         boundingRect = cv::boundingRect(contour);
 
-        if (boundingRect.height >= sprocketMinHeight_ && boundingRect.height <= sprocketDetectHeight) { //Within the range
-            int cx = boundingRect.x + boundingRect.width / 2 + leftSprocketEdge;    //Move right so slice offset aligns to OG frame
-            int cy = boundingRect.y + boundingRect.height / 2;
+        if (boundingRect.height >= sprocketMinHeight_) { //Tall enough for Tinder?
+            // Transform coordinates back to original frame
+            int cx = boundingRect.x + boundingRect.width / 2 + leftSprocketEdge;
+            int cy = boundingRect.y + boundingRect.height / 2 + detectTop;
             sprocketCenter_ = cv::Point(cx, cy);
+            
+            // Transform boundingRect to original frame coordinates for drawing
+            boundingRect.x += leftSprocketEdge;
+            boundingRect.y += detectTop;
+            
             sprocketDetected_ = true;
+            reacquireSprocket = false;
             break;
 
         }
@@ -1080,12 +1232,16 @@ void ScannerApp::onStartScan() {
 
     saveSetupSettings();
     camera_.stopVideo();
+    camera_.startPhoto();
 
     computeMovePerFrame();
     scanning_ = true;
     currentState_ = SCANNING;
     frameCount_ = 0;            //TODO: Don't always reset
     
+    fanOn_ = false;         //Set off, toggle to ON
+    onFanToggle();
+
     scanButton_->setEnabled(false);
     stopButton_->setEnabled(true);
    
@@ -1101,6 +1257,11 @@ void ScannerApp::onStopScan() {
     
     std::cout << "Scan stopped. Captured " << frameCount_ << " frames." << std::endl;
 
+    camera_.stopPhoto();
+
+    fanOn_ = true;         //Set on, toggle to OFF
+    onFanToggle();
+
     onSwitchToPreview();    //Manually back to this
 
 }
@@ -1108,6 +1269,11 @@ void ScannerApp::onStopScan() {
 void ScannerApp::onSwitchToSetup() {
 
     camera_.stopVideo();
+    
+    if (!camera_.startPhoto()) {
+        std::cerr << "Failed to start photo mode for setup" << std::endl;
+        return;
+    }
 
     if (camera_.capturePhoto(frame)) {
         setupFrame_ = frame.clone();
@@ -1116,6 +1282,7 @@ void ScannerApp::onSwitchToSetup() {
         std::cerr << "Failed to capture setup photo" << std::endl;
     }
     
+    // Keep photo mode running for setup adjustments
     currentState_ = SETUP;
     
 }
@@ -1125,6 +1292,9 @@ void ScannerApp::onSwitchToPreview() {
     saveSetupSettings();
 
     std::cout << "Switching to preview mode..." << std::endl;
+
+    // Stop photo mode if it was running
+    camera_.stopPhoto();
 
     if (!camera_.startVideo()) {
         std::cerr << "Failed to start video stream" << std::endl;
@@ -1179,7 +1349,7 @@ void ScannerApp::onMotorsToggle() {
 }
 
 void ScannerApp::onSelectExportFolder() {
-    QString folder = QFileDialog::getExistingDirectory(this, "Select Export Folder", "",
+    QString folder = QFileDialog::getExistingDirectory(this, "Select Export Folder", "/media/ben/Super8_SSD",
                                                          QFileDialog::DontUseNativeDialog);
     if (!folder.isEmpty()) {
         exportFolder_ = folder.toStdString();
@@ -1211,6 +1381,47 @@ void ScannerApp::onBitDepthChanged(int id) {
     photoBitDepth = static_cast<bitState>(id);
     std::cout << "Photo bit depth set to: " << (id == DEPTH_8BIT ? "8-bit" : "16-bit") << std::endl;
 
+}
+
+void ScannerApp::onRewindStart() {
+    if (!marlin_) {
+        QMessageBox::warning(this, "Marlin Not Connected", 
+            "Cannot rewind - Marlin controller not connected.");
+        return;
+    }
+    
+    if (rewinding_) return; // Already rewinding
+    
+    rewinding_ = true;
+    rewindButton->setEnabled(false);
+    rewindStopButton->setEnabled(true);
+    
+    std::cout << "Starting rewind..." << std::endl;
+    
+    // Send a very large backwards move on Y axis at high speed
+    // Use relative positioning and move backwards
+    marlin_->sendGcode("G91");  // Set to relative positioning
+    marlin_->sendGcode("G1 Y-100000 F10000");  // Move backwards 100 meters at 5000mm/min
+    
+    std::cout << "Rewind started (press Stop Rewind to stop)" << std::endl;
+}
+
+void ScannerApp::onRewindStop() {
+    if (!rewinding_) return;
+    
+    rewinding_ = false;
+    rewindButton->setEnabled(true);
+    rewindStopButton->setEnabled(false);
+    
+    std::cout << "Stopping rewind..." << std::endl;
+    
+    if (marlin_) {
+        // Send quickstop command to halt movement immediately
+        marlin_->sendGcode("M410");  // Quickstop - stop all moves
+        marlin_->sendGcode("G91");   // Set to relative positioning
+    }
+    
+    std::cout << "Rewind stopped" << std::endl;
 }
 
 //Main entry point

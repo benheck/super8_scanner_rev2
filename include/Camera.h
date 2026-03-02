@@ -21,6 +21,8 @@ public:
     bool setVideoBitDepth(int bitDepth);
     bool startVideo();
     bool stopVideo();
+    bool startPhoto();
+    bool stopPhoto();
     bool getVideoFrame(cv::Mat& frame);
 
     // Photo mode
@@ -49,10 +51,12 @@ private:
     std::shared_ptr<libcamera::Camera> camera_;
     std::unique_ptr<libcamera::CameraConfiguration> videoConfig_;
     std::unique_ptr<libcamera::CameraConfiguration> photoConfig_;
-    std::unique_ptr<libcamera::FrameBufferAllocator> allocator_;
+    std::unique_ptr<libcamera::FrameBufferAllocator> videoAllocator_;
+    std::unique_ptr<libcamera::FrameBufferAllocator> photoAllocator_;
     
     std::map<libcamera::FrameBuffer*, std::vector<uint8_t>> mappedBuffers_;
     std::vector<std::unique_ptr<libcamera::Request>> videoRequests_;
+    std::vector<std::unique_ptr<libcamera::Request>> photoRequests_;
     
     // Video settings
     int videoWidth_ = 1920;
@@ -76,6 +80,7 @@ private:
     // State
     bool initialized_ = false;
     bool videoRunning_ = false;
+    bool photoRunning_ = false;
     
     // Thread-safe frame queue
     std::queue<cv::Mat> frameQueue_;
@@ -88,4 +93,7 @@ private:
     std::condition_variable photoCV_;
     cv::Mat capturedPhoto_;
     bool photoReady_ = false;
+    bool captureRequested_ = false;
+    int photoFrameCount_ = 0;
+    size_t currentPhotoRequest_ = 0;
 };

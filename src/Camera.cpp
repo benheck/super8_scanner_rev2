@@ -134,15 +134,15 @@ bool PiCamera::startVideo() {
     
     // Allocate buffers
     Stream* stream = streamConfig.stream();
-    allocator_ = std::make_unique<FrameBufferAllocator>(camera_);
+    videoAllocator_ = std::make_unique<FrameBufferAllocator>(camera_);
     
-    if (allocator_->allocate(stream) < 0) {
+    if (videoAllocator_->allocate(stream) < 0) {
         std::cerr << "Failed to allocate buffers" << std::endl;
         return false;
     }
     
     // Create requests
-    const std::vector<std::unique_ptr<FrameBuffer>>& buffers = allocator_->buffers(stream);
+    const std::vector<std::unique_ptr<FrameBuffer>>& buffers = videoAllocator_->buffers(stream);
     for (unsigned int i = 0; i < buffers.size(); ++i) {
         std::unique_ptr<Request> request = camera_->createRequest();
         if (!request) {
@@ -228,9 +228,9 @@ bool PiCamera::stopVideo() {
     videoRequests_.clear();
     mappedBuffers_.clear();
     
-    if (allocator_) {
-        allocator_->free(videoConfig_->at(0).stream());
-        allocator_.reset();
+    if (videoAllocator_) {
+        videoAllocator_->free(videoConfig_->at(0).stream());
+        videoAllocator_.reset();
     }
     
     // Clear frame queue
@@ -241,6 +241,132 @@ bool PiCamera::stopVideo() {
     
     videoRunning_ = false;
     std::cout << "Video stream stopped" << std::endl;
+    
+    return true;
+}
+
+bool PiCamera::startPhoto() {
+    if (!initialized_) {
+        std::cerr << "Camera not initialized" << std::endl;
+        return false;
+    }
+    
+    if (photoRunning_) {
+        std::cout << "Photo mode already running" << std::endl;
+        return true;
+    }
+    
+    std::cout << "Starting photo mode..." << std::endl;
+    
+    // Generate photo configuration ONCE
+    photoConfig_ = camera_->generateConfiguration({StreamRole::StillCapture});
+    if (!photoConfig_) {
+        std::cerr << "Failed to generate photo configuration" << std::endl;
+        return false;
+    }
+    
+    // Configure photo stream
+    StreamConfiguration& streamConfig = photoConfig_->at(0);
+    streamConfig.size.width = photoWidth_;
+    streamConfig.size.height = photoHeight_;
+    streamConfig.pixelFormat = PixelFormat::fromString(photoBitDepth);
+    
+    std::cout << "Photo config - Size: " << photoWidth_ << "x" << photoHeight_ 
+              << ", Format: " << photoBitDepth << std::endl;
+    
+    // Validate and apply configuration ONCE
+    photoConfig_->validate();
+    if (camera_->configure(photoConfig_.get())) {
+        std::cerr << "Failed to configure camera for photo" << std::endl;
+        return false;
+    }
+    
+    std::cout << "Photo configuration applied successfully" << std::endl;
+    
+    // Allocate buffers ONCE
+    Stream* stream = streamConfig.stream();
+    photoAllocator_ = std::make_unique<FrameBufferAllocator>(camera_);
+    if (photoAllocator_->allocate(stream) < 0) {
+        std::cerr << "Failed to allocate photo buffers" << std::endl;
+        return false;
+    }
+    
+    std::cout << "Photo buffers allocated: " << photoAllocator_->buffers(stream).size() << std::endl;
+    
+    // Create photo requests and keep them alive
+    const std::vector<std::unique_ptr<FrameBuffer>>& buffers = photoAllocator_->buffers(stream);
+    for (unsigned int i = 0; i < buffers.size(); ++i) {
+        std::unique_ptr<Request> request = camera_->createRequest();
+        if (!request) {
+            std::cerr << "Failed to create photo request" << std::endl;
+            return false;
+        }
+        
+        const std::unique_ptr<FrameBuffer>& buffer = buffers[i];
+        if (request->addBuffer(stream, buffer.get())) {
+            std::cerr << "Failed to add buffer to photo request" << std::endl;
+            return false;
+        }
+        
+        photoRequests_.push_back(std::move(request));
+    }
+    
+    std::cout << "Created " << photoRequests_.size() << " photo request(s)" << std::endl;
+    
+    // Reset state
+    currentPhotoRequest_ = 0;
+    photoFrameCount_ = 0;
+    captureRequested_ = false;
+    
+    // Connect photo callback
+    camera_->requestCompleted.connect(this, &PiCamera::photoRequestComplete);
+    
+    // Start camera and keep it running
+    if (camera_->start()) {
+        std::cerr << "Failed to start camera in photo mode" << std::endl;
+        photoAllocator_->free(stream);
+        photoAllocator_.reset();
+        photoRequests_.clear();
+        return false;
+    }
+    
+    // Queue all requests to keep camera streaming
+    for (auto& request : photoRequests_) {
+        camera_->queueRequest(request.get());
+    }
+    
+    photoRunning_ = true;
+    std::cout << "Photo mode started - camera running continuously" << std::endl;
+    
+    return true;
+}
+
+bool PiCamera::stopPhoto() {
+    if (!photoRunning_) {
+        return true;
+    }
+    
+    std::cout << "Stopping photo mode..." << std::endl;
+    
+    // Stop camera (this will cancel pending requests)
+    camera_->stop();
+    
+    // Disconnect callback
+    camera_->requestCompleted.disconnect(this, &PiCamera::photoRequestComplete);
+    
+    // Clear requests
+    photoRequests_.clear();
+    
+    // Free buffers
+    if (photoAllocator_ && photoConfig_) {
+        photoAllocator_->free(photoConfig_->at(0).stream());
+        photoAllocator_.reset();
+    }
+    
+    photoConfig_.reset();
+    photoRunning_ = false;
+    
+    std::cout << "Photo mode stopped" << std::endl;
     
     return true;
 }
@@ -350,101 +476,47 @@ bool PiCamera::setPhotoBitDepth(int bitDepth) {
 }
 
 bool PiCamera::capturePhoto(cv::Mat& image) {
-
-    if (!initialized_) return false;
-    
-    // Stop video if running
-    bool wasRunning = videoRunning_;
-
-    if (wasRunning) {
-        stopVideo();
-    }
-    
-    // Generate photo configuration
-    auto photoConfig = camera_->generateConfiguration({StreamRole::StillCapture});
-
-    if (!photoConfig) {
-        std::cerr << "Failed to generate photo configuration" << std::endl;
+    if (!initialized_) {
+        std::cerr << "Camera not initialized" << std::endl;
         return false;
     }
     
-    // Configure photo stream
-    StreamConfiguration& streamConfig = photoConfig->at(0);
-    streamConfig.size.width = photoWidth_;
-    streamConfig.size.height = photoHeight_;
-    streamConfig.pixelFormat = PixelFormat::fromString(photoBitDepth);
-    
-    // Validate and apply
-    photoConfig->validate();
-
-    if (camera_->configure(photoConfig.get())) {
-        std::cerr << "Failed to configure camera for photo" << std::endl;
+    if (!photoRunning_) {
+        std::cerr << "Photo mode not started - call startPhoto() first" << std::endl;
         return false;
     }
     
-    // Allocate buffer
-    Stream* stream = streamConfig.stream();
-    auto allocator = std::make_unique<FrameBufferAllocator>(camera_);
-    allocator->allocate(stream);
-    
-    const std::vector<std::unique_ptr<FrameBuffer>>& buffers = allocator->buffers(stream);
-    
-    // Create request
-    std::unique_ptr<Request> request = camera_->createRequest();
-    request->addBuffer(stream, buffers[0].get());
-    
-    // Set controls (same as video)
-    ControlList& controls = request->controls();
-
-    if (whiteBalanceMode_ == "auto") {
-        controls.set(controls::AwbEnable, true);
+    // Request a fresh capture on the next frame
+    {
+        std::lock_guard<std::mutex> lock(photoMutex_);
+        photoReady_ = false;
+        captureRequested_ = true;
     }
-    else {
-        controls.set(controls::AwbEnable, false);
-        if (whiteBalanceMode_ == "incandescent") {
-            controls.set(controls::ColourGains, libcamera::Span<const float, 2>({1.5f, 1.0f}));
+    
+    // Wait for the next frame to arrive
+    bool success = false;
+    {
+        std::unique_lock<std::mutex> lock(photoMutex_);
+        if (photoCV_.wait_for(lock, std::chrono::seconds(2), [this] { return photoReady_; })) {
+            if (photoReady_) {
+                image = capturedPhoto_.clone();
+                success = true;
+            }
+        } else {
+            std::cerr << "Photo capture timeout" << std::endl;
+            captureRequested_ = false;
         }
     }
     
-    if (exposureMs_ > 0.0f) {
-        controls.set(controls::AeEnable, false);
-        controls.set(controls::ExposureTime, static_cast<int32_t>(exposureMs_ * 1000));
-        controls.set(controls::AnalogueGain, gain_);
-    }
-    
-    // Setup photo capture callback
-    photoReady_ = false;
-    camera_->requestCompleted.connect(this, &PiCamera::photoRequestComplete);
-    
-    // Start and queue request
-    camera_->start();
-    camera_->queueRequest(request.get());
-    
-    // Wait for photo
-    {
-        std::unique_lock<std::mutex> lock(photoMutex_);
-        photoCV_.wait_for(lock, std::chrono::seconds(2), [this] { return photoReady_; });
-    }
-    
-    camera_->stop();
-    camera_->requestCompleted.disconnect(this, &PiCamera::photoRequestComplete);
-    
-    if (photoReady_) {
-        image = capturedPhoto_.clone();
-    }
-    
-    // Restart video if it was running
-    if (wasRunning) {
-        startVideo();
-    }
-    
-    return photoReady_;
-
+    return success;
 }
 
 void PiCamera::photoRequestComplete(Request* request) {
 
     if (request->status() != Request::RequestComplete) {
+        // Requeue even on error to keep streaming
+        request->reuse(Request::ReuseBuffers);
+        camera_->queueRequest(request);
         return;
     }
     
@@ -460,31 +532,43 @@ void PiCamera::photoRequestComplete(Request* request) {
             const StreamConfiguration& cfg = request->buffers().begin()->first->configuration();
             size_t stride = cfg.stride;
             
-            // Process based on bit depth
-            if (photoBitDepth == "SRGGB10") {
-                // RAW 10-bit Bayer format - need to debayer
-                // SRGGB10 is packed 10-bit, but we'll treat it as 16-bit for OpenCV
-                cv::Mat rawImage(photoHeight_, photoWidth_, CV_16UC1, memory, stride);
+            std::lock_guard<std::mutex> lock(photoMutex_);
+            
+            // Always process the frame
+            photoFrameCount_++;
+            
+            // Only capture if requested
+            if (captureRequested_) {
+                // Process based on bit depth
+                if (photoBitDepth == "SRGGB10") {
+                    // RAW 10-bit Bayer format - need to debayer
+                    // SRGGB10 is packed 10-bit, but we'll treat it as 16-bit for OpenCV
+                    cv::Mat rawImage(photoHeight_, photoWidth_, CV_16UC1, memory, stride);
+                    
+                    // Debayer using RG Bayer pattern to BGR
+                    cv::cvtColor(rawImage, capturedPhoto_, cv::COLOR_BayerRG2BGR);
+                } else if (photoBitDepth == "RGB161616") {
+                    // 16-bit RGB processing
+                    cv::Mat rgb16Image(photoHeight_, photoWidth_, CV_16UC3, memory, stride);
+                    cv::cvtColor(rgb16Image, capturedPhoto_, cv::COLOR_RGB2BGR);
+                } else {
+                    // 8-bit processing (RGB888)
+                    cv::Mat rgb8Image(photoHeight_, photoWidth_, CV_8UC3, memory, stride);
+                    cv::cvtColor(rgb8Image, capturedPhoto_, cv::COLOR_RGB2BGR);
+                }
                 
-                // Debayer using RG Bayer pattern to BGR
-                cv::cvtColor(rawImage, capturedPhoto_, cv::COLOR_BayerRG2BGR);
-            } else if (photoBitDepth == "RGB161616") {
-                // 16-bit RGB processing
-                cv::Mat rgb16Image(photoHeight_, photoWidth_, CV_16UC3, memory, stride);
-                cv::cvtColor(rgb16Image, capturedPhoto_, cv::COLOR_RGB2BGR);
-            } else {
-                // 8-bit processing (RGB888)
-                cv::Mat rgb8Image(photoHeight_, photoWidth_, CV_8UC3, memory, stride);
-                cv::cvtColor(rgb8Image, capturedPhoto_, cv::COLOR_RGB2BGR);
+                photoReady_ = true;
+                captureRequested_ = false;
+                photoCV_.notify_one();
             }
             
             munmap(memory, plane.length);
-            
-            std::lock_guard<std::mutex> lock(photoMutex_);
-            photoReady_ = true;
-            photoCV_.notify_one();
         }
     }
+    
+    // Requeue request to keep streaming
+    request->reuse(Request::ReuseBuffers);
+    camera_->queueRequest(request);
 
 }
 

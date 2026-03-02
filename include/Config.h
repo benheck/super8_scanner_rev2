@@ -17,7 +17,7 @@ namespace Config {
     constexpr float BASE_SPOOL_DIAMETER = 31.3f;
     
     // Sprocket detection
-    constexpr int SPROCKET_THRESHOLD_DEFAULT = 25;
+    constexpr int SPROCKET_THRESHOLD_DEFAULT = 150;
     constexpr int SAMPLE_Y_OFFSET = 180;
     
     // Export settings
