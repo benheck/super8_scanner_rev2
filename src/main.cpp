@@ -3,6 +3,10 @@
 #include "Config.h"
 
 #include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include <QApplication>
 #include <QWidget>
 #include <QLabel>
@@ -43,6 +47,13 @@ enum bitState {
     DEPTH_16BIT
 };
 
+// Structure for queuing image saves
+struct SaveJob {
+    cv::Mat image;
+    std::string filename;
+    int frameNumber;
+};
+
 class ScannerApp : public QWidget {
     Q_OBJECT
 
@@ -79,6 +90,9 @@ private:
     bool scanning_;
     bool waitingForMoveCompletion_;
     std::chrono::high_resolution_clock::time_point moveCompletionStartTime_;
+    bool waitingForSettling_;  // Wait for film/camera to settle after move
+    std::chrono::high_resolution_clock::time_point settlingStartTime_;
+    int settlingDelayMs_ = 50;  // Delay after move before next capture (ms)
     bitState photoBitDepth = DEPTH_8BIT;
     bool lightOn_;
     bool fanOn_;
@@ -123,6 +137,10 @@ private:
     int skipFrameCount = 0;
     int skipFrameTarget = 50;
     std::chrono::high_resolution_clock::time_point lastSaveTime;
+    
+    // Display optimization during scan
+    int displayUpdateInterval = 5;  // Update display every N frames (0 = never, 1 = always)
+    int framesSinceDisplayUpdate = 0;
 
 
 
@@ -135,6 +153,9 @@ private:
     QPushButton* setupButton_ = new QPushButton("Setup Mode");
     QPushButton* scanButton_ = new QPushButton("Start Scan");
     QPushButton* stopButton_ = new QPushButton("Stop Scan");
+    QPushButton* colorTempButton_ = new QPushButton("WB: Auto");
+    QPushButton* exposureButton_ = new QPushButton("AE: ON");
+
     QRadioButton* radio8bitDepth_;
     QRadioButton* radio16bitDepth_;
     QButtonGroup* bitDepthGroup_;
@@ -178,6 +199,16 @@ private:
     cv::Mat setupFrame_;
     cv::Mat scannedFrame_;
     
+    bool detailTimeLogging = true;
+    
+    // Background save thread
+    std::thread saveThread_;
+    std::queue<SaveJob> saveQueue_;
+    std::mutex saveMutex_;
+    std::condition_variable saveCondition_;
+    std::atomic<bool> saveThreadRunning_;
+    std::atomic<int> pendingSaves_;
+
     // Helper methods
     void initializeUI();
     QLabel* createLabel(const QString &text, int = 14);
@@ -199,6 +230,12 @@ private:
     void loadSetupSettings();
 
     void drawText(cv::Mat& frame, std::string text, int x, int y, double fontScale = 1.0);
+    
+    // Background save methods
+    void startSaveThread();
+    void stopSaveThread();
+    void saveThreadWorker();
+    void queueImageSave(const cv::Mat& image, const std::string& filename, int frameNumber);
 
 };
 
@@ -209,6 +246,7 @@ ScannerApp::ScannerApp(QWidget* parent)
       currentState_(PREVIEW),
       scanning_(false),
       waitingForMoveCompletion_(false),
+      waitingForSettling_(false),
       lightOn_(false),
       fanOn_(false),
       motorsEnabled_(false),
@@ -217,7 +255,9 @@ ScannerApp::ScannerApp(QWidget* parent)
       focusZoomedIn_(false),
       spoolDiameter_(Config::BASE_SPOOL_DIAMETER),
       sprocketBrightnessThreshold_(Config::SPROCKET_THRESHOLD_DEFAULT),
-      sprocketDetected_(false) {
+      sprocketDetected_(false),
+      saveThreadRunning_(false),
+      pendingSaves_(0) {
     
     initializeUI();
     connectSignals();
@@ -227,6 +267,9 @@ ScannerApp::ScannerApp(QWidget* parent)
     setStyleSheet("QWidget#ScannerApp { background-color: #333333; }");
     setObjectName("ScannerApp");
     
+    // Start background save thread
+    startSaveThread();
+    
     // Defer hardware initialization until after window is shown
     QTimer::singleShot(100, this, &ScannerApp::initializeHardware);
 }
@@ -234,6 +277,9 @@ ScannerApp::ScannerApp(QWidget* parent)
 ScannerApp::~ScannerApp() {
     // Stop initialization if still running
     initializationComplete_ = true;
+    
+    // Stop save thread before cleanup
+    stopSaveThread();
     
     if (marlin_) {
         marlin_->setLight(false);
@@ -371,9 +417,19 @@ void ScannerApp::initializeUI() {
     rightLayout->addWidget(setupButton_, 2, 1); 
     rightLayout->addWidget(scanButton_, 3, 1);
     rightLayout->addWidget(stopButton_, 4, 1);
+    rightLayout->addWidget(colorTempButton_, 5, 1);
+    rightLayout->addWidget(exposureButton_, 6, 1);
+
+    // Export folder
+    rightLayout->addWidget(createLabel("Image Filename Prefix:"), 7, 1);      //The label
+    exportPrefixEdit_ = new QLineEdit("image_");   //Default prefix
+    exportPrefixEdit_->setStyleSheet("background-color: white; color: black; padding: 5px; font-size: 14px;");
+    rightLayout->addWidget(exportPrefixEdit_, 8, 1);       //The text
+    rightLayout->addWidget(setImagePrefixButton_, 9, 1);   //The set button
+    rightLayout->addWidget(exportFolderButton_, 10, 1);     //Opens a file dialog
     
     // Bit depth radio buttons
-    rightLayout->addWidget(createLabel("Bit Depth:"), 9, 1);
+    rightLayout->addWidget(createLabel("Bit Depth:"), 11, 1);
     radio8bitDepth_ = new QRadioButton("8-bit");
     radio16bitDepth_ = new QRadioButton("16-bit");
     bitDepthGroup_ = new QButtonGroup(this);
@@ -382,16 +438,10 @@ void ScannerApp::initializeUI() {
     radio8bitDepth_->setChecked(true);  // Default to 8-bit
     radio8bitDepth_->setStyleSheet("color: white; font-size: 14px; padding: 5px;");
     radio16bitDepth_->setStyleSheet("color: white; font-size: 14px; padding: 5px;");
-    rightLayout->addWidget(radio8bitDepth_, 10, 1);
-    rightLayout->addWidget(radio16bitDepth_, 11, 1);
+    rightLayout->addWidget(radio8bitDepth_, 12, 1);
+    rightLayout->addWidget(radio16bitDepth_, 13, 1);
 
-    // Export folder
-    rightLayout->addWidget(createLabel("Image Filename Prefix:"), 5, 1);      //The label
-    exportPrefixEdit_ = new QLineEdit("image_");   //Default prefix
-    exportPrefixEdit_->setStyleSheet("background-color: white; color: black; padding: 5px; font-size: 14px;");
-    rightLayout->addWidget(exportPrefixEdit_, 6, 1);       //The text
-    rightLayout->addWidget(setImagePrefixButton_, 7, 1);   //The set button
-    rightLayout->addWidget(exportFolderButton_, 8, 1);     //Opens a file dialog
+
 
     // Add panels to main layout
     mainLayout->addLayout(leftLayout, 2);
@@ -539,6 +589,28 @@ void ScannerApp::connectSignals() {
     
     // Bit depth radio button connection
     connect(bitDepthGroup_, &QButtonGroup::idClicked, this, &ScannerApp::onBitDepthChanged);
+
+    // Color temperature cycling
+    connect(colorTempButton_, &QPushButton::clicked, [this]() {
+        static const std::vector<std::string> modes = {
+            "auto", "incandescent", "tungsten", "fluorescent", "indoor", "daylight", "cloudy"
+        };
+        static const std::vector<QString> labels = {
+            "WB: Auto", "WB: Incandescent", "WB: Tungsten",
+            "WB: Fluorescent", "WB: Indoor", "WB: Daylight", "WB: Cloudy"
+        };
+        static int index = 0;
+        index = (index + 1) % static_cast<int>(modes.size());
+        camera_.setWhiteBalance(modes[index]);
+        colorTempButton_->setText(labels[index]);
+    });
+
+    // Auto-exposure toggle (default ON)
+    connect(exposureButton_, &QPushButton::clicked, [this]() {
+        autoExposureOn = !autoExposureOn;
+        camera_.setAutoExposure(autoExposureOn);
+        exposureButton_->setText(autoExposureOn ? "AE: ON" : "AE: OFF");
+    });
 
     updateTimer_ = new QTimer(this);
 
@@ -739,25 +811,31 @@ void ScannerApp::updateFrame() {
 
         case SCANNING:
             if (waitingForMoveCompletion_) {
-                // Check if move is complete without blocking
-                if (marlin_ && marlin_->checkForOK()) {
-                    std::cout << "Move completed, ready for next frame" << std::endl;
+                // Check if M400 response received
+                if (marlin_->checkForOK()) {
                     waitingForMoveCompletion_ = false;
-                    // Process events to keep UI responsive
-                    QApplication::processEvents();
-                } else {
-                    // Check for timeout (10 seconds)
-                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::high_resolution_clock::now() - moveCompletionStartTime_);
-                    if (elapsed.count() > 10000) {
-                        std::cerr << "WARNING: Move completion timeout after " << elapsed.count() 
-                                  << "ms - continuing anyway" << std::endl;
-                        waitingForMoveCompletion_ = false;
+                    waitingForSettling_ = true;
+                    settlingStartTime_ = std::chrono::high_resolution_clock::now();
+                    if (detailTimeLogging) {
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::high_resolution_clock::now() - moveCompletionStartTime_);
+                        std::cout << "  M400 verification: " << elapsed.count() << " ms" << std::endl;
                     }
                 }
-                // Still waiting, don't capture next frame yet
-            } else if (scanning_) {
-                // Ready to capture next frame
+            }
+            else if (waitingForSettling_) {
+                // Wait for settling delay
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::high_resolution_clock::now() - settlingStartTime_);
+                if (elapsed.count() >= settlingDelayMs_) {
+                    waitingForSettling_ = false;
+                    if (detailTimeLogging) {
+                        std::cout << "  Settling delay: " << settlingDelayMs_ << " ms" << std::endl;
+                    }
+                }
+            }
+            else if (scanning_) {
+                // Ready for next frame
                 scanSingleFrame();
             }
             break;
@@ -844,7 +922,16 @@ float ScannerApp::computeFocusScore(const cv::Mat &image) {
     // Extract a strip of pixels from the center of the image
     int stripHeight = 100; // Height of the strip
     int centerY = image.rows / 2;
-    cv::Rect centerStrip(0, centerY - stripHeight / 2, image.cols, stripHeight);
+    
+    // Bounds checking for strip ROI
+    int stripY = std::max(0, centerY - stripHeight / 2);
+    int stripH = std::min(stripHeight, image.rows - stripY);
+    
+    if (stripH <= 0 || image.cols <= 0) {
+        return 0.0f; // Invalid dimensions
+    }
+    
+    cv::Rect centerStrip(0, stripY, image.cols, stripH);
     cv::Mat strip = image(centerStrip);
 
     // Convert the strip to grayscale if it's not already
@@ -922,17 +1009,29 @@ void ScannerApp::drawSetupOverlay(cv::Mat& frame) {
     cv::line(frame, cv::Point(rightScanEdge, 0), cv::Point(rightScanEdge, frame.rows), 
              cv::Scalar(0, 255, 255), 8);
 
-    // Draw frame scan guide
+    // Draw frame scan guide with bounds checking
     drawText(frame, "SCAN FRAME", leftScanEdge + 20, centerY - (verticalScanHeight / 2) - 25, 1.5);
-    cv::Rect frameRect(leftScanEdge, centerY - (verticalScanHeight / 2), 
-                      rightScanEdge - leftScanEdge, verticalScanHeight);
-    cv::rectangle(frame, frameRect, cv::Scalar(0, 255, 255), 8);
+    
+    int rectX = std::max(0, std::min(leftScanEdge, frame.cols - 1));
+    int rectY = std::max(0, std::min(centerY - (verticalScanHeight / 2), frame.rows - 1));
+    int rectW = std::min(rightScanEdge - leftScanEdge, frame.cols - rectX);
+    int rectH = std::min(verticalScanHeight, frame.rows - rectY);
+    
+    if (rectW > 0 && rectH > 0) {
+        cv::Rect frameRect(rectX, rectY, rectW, rectH);
+        cv::rectangle(frame, frameRect, cv::Scalar(0, 255, 255), 8);
+    }
 
     // Draw a frame the height of the screen, from rightScanEdge to rightScanEdge + 20:
-    cv::rectangle(frame, 
-                  cv::Point(rightScanEdge, 0),
-                  cv::Point(rightScanEdge + 50, frame.rows),
-                  cv::Scalar(255, 0, 255), 8);
+    int rightCheckX = std::min(rightScanEdge, frame.cols - 50);
+    int rightCheckW = std::min(50, frame.cols - rightCheckX);
+    
+    if (rightCheckX >= 0 && rightCheckW > 0) {
+        cv::rectangle(frame, 
+                      cv::Point(rightCheckX, 0),
+                      cv::Point(rightCheckX + rightCheckW, frame.rows),
+                      cv::Scalar(255, 0, 255), 8);
+    }
 
     // Draw overlay specific to setup mode
     drawText(frame, "SETUP", 20, 200, 5);
@@ -943,14 +1042,23 @@ void ScannerApp::scanSingleFrame() {
 
     if (!scanning_) return;
 
-    if (!camera_.capturePhoto(scannedFrame_)) {
-        std::cerr << "Failed to capture photo" << std::endl;
-        return;
+    auto frameStartTime = std::chrono::high_resolution_clock::now();
+    auto stepStartTime = frameStartTime;
+    
+    if (detailTimeLogging) {
+        std::cout << "\n=== Frame " << frameCount_ << " Timing ==="<< std::endl;
     }
 
     if (!camera_.capturePhoto(scannedFrame_)) {
         std::cerr << "Failed to capture photo" << std::endl;
         return;
+    }
+    
+    if (detailTimeLogging) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - stepStartTime);
+        std::cout << "  Photo capture: " << elapsed.count() << " ms" << std::endl;
+        stepStartTime = std::chrono::high_resolution_clock::now();
     }
     
     if (scannedFrame_.empty()) {
@@ -959,7 +1067,22 @@ void ScannerApp::scanSingleFrame() {
     }
 
     cv::flip(scannedFrame_, scannedFrame_, 1);                //Flip frame horizontally
+    
+    if (detailTimeLogging) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - stepStartTime);
+        std::cout << "  Frame flip: " << elapsed.count() << " ms" << std::endl;
+        stepStartTime = std::chrono::high_resolution_clock::now();
+    }
+    
     findSprocket(scannedFrame_);
+    
+    if (detailTimeLogging) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - stepStartTime);
+        std::cout << "  Sprocket detection: " << elapsed.count() << " ms" << std::endl;
+        stepStartTime = std::chrono::high_resolution_clock::now();
+    }
 
     cv::Mat croppedFrame;
 
@@ -982,6 +1105,13 @@ void ScannerApp::scanSingleFrame() {
         }
 
         croppedFrame = scannedFrame_(frameRect).clone(); //Clone to ensure continuous memory
+        
+        if (detailTimeLogging) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - stepStartTime);
+            std::cout << "  Frame cropping: " << elapsed.count() << " ms" << std::endl;
+            stepStartTime = std::chrono::high_resolution_clock::now();
+        }
 
         //Draw rectangle on scannedFrame_ for display (not export)
         cv::rectangle(scannedFrame_, 
@@ -1013,26 +1143,32 @@ void ScannerApp::scanSingleFrame() {
                 cv::Scalar(255, 0, 0), 2);
         
         //Check rightScanEdge to rightScanEdge + 50 area, from y0 to frame.rows, and if it ISN'T black, stop the scan:
-        cv::Rect rightEdgeRect(rightScanEdge, 0, 50, scannedFrame_.rows);
-        cv::Mat rightEdgeArea = scannedFrame_(rightEdgeRect);
+        // Add bounds checking to prevent ROI out of bounds
+        int checkX = std::min(rightScanEdge, scannedFrame_.cols - 50);
+        int checkWidth = std::min(50, scannedFrame_.cols - checkX);
+        
+        if (checkX >= 0 && checkWidth > 0) {
+            cv::Rect rightEdgeRect(checkX, 0, checkWidth, scannedFrame_.rows);
+            cv::Mat rightEdgeArea = scannedFrame_(rightEdgeRect);
 
-        cv::Mat grayRightEdge;
-        cv::cvtColor(rightEdgeArea, grayRightEdge, cv::COLOR_BGR2GRAY);
-        cv::Scalar meanBrightness = cv::mean(grayRightEdge);
-        double avgVal = meanBrightness[0];
+            cv::Mat grayRightEdge;
+            cv::cvtColor(rightEdgeArea, grayRightEdge, cv::COLOR_BGR2GRAY);
+            cv::Scalar meanBrightness = cv::mean(grayRightEdge);
+            double avgVal = meanBrightness[0];
 
-        if (avgVal > 128) { //If average brightness is high, we hit the end of the film
-            std::cout << "End of film detected, stopping scan." << std::endl;
-            onStopScan();
-            QMessageBox::information(this, "Scan Complete", 
-                "End of film detected. Scan stopped automatically.");
+            if (avgVal > 128) { //If average brightness is high, we hit the end of the film
+                std::cout << "End of film detected, stopping scan." << std::endl;
+                onStopScan();
+                QMessageBox::information(this, "Scan Complete", 
+                    "End of film detected. Scan stopped automatically.");
+            }
+
+            //Draw a white rectangle around the area being checked:
+            cv::rectangle(scannedFrame_, 
+                          cv::Point(checkX, 0),
+                          cv::Point(checkX + checkWidth, scannedFrame_.rows),
+                          cv::Scalar(255, 255, 255), 8);
         }
-
-        //Draw a white rectangle around the area being checked:
-        cv::rectangle(scannedFrame_, 
-                      cv::Point(rightScanEdge, 0),
-                      cv::Point(rightScanEdge + 50, scannedFrame_.rows),
-                      cv::Scalar(255, 255, 255), 8);
 
         // Update display
         updateVideoDisplay(scannedFrame_);
@@ -1040,7 +1176,7 @@ void ScannerApp::scanSingleFrame() {
         // Force UI to update
         QApplication::processEvents();
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        //std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
 
         
@@ -1054,8 +1190,15 @@ void ScannerApp::scanSingleFrame() {
         return;
     }
 
-    // Advance film before we start the save
+    // Advance film and wait for completion before processing
     advanceFilmTracking(1.0f, 3000.0f, true);
+    
+    if (detailTimeLogging) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - stepStartTime);
+        std::cout << "  Film advance (blocking): " << elapsed.count() << " ms" << std::endl;
+        stepStartTime = std::chrono::high_resolution_clock::now();
+    }
     
     // Process and save
     std::ostringstream oss;
@@ -1066,7 +1209,24 @@ void ScannerApp::scanSingleFrame() {
     // Camera actually outputs BGR despite RGB161616 name - convert to RGB for correct colors
     cv::Mat rgbFrame;
     cv::cvtColor(croppedFrame, rgbFrame, cv::COLOR_BGR2RGB);
-    cv::imwrite(filename, rgbFrame);
+    
+    if (detailTimeLogging) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - stepStartTime);
+        std::cout << "  Color conversion: " << elapsed.count() << " ms" << std::endl;
+        stepStartTime = std::chrono::high_resolution_clock::now();
+    }
+    
+    // Queue the image to be saved in background thread
+    queueImageSave(rgbFrame, filename, frameCount_);
+    
+    if (detailTimeLogging) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - stepStartTime);
+        std::cout << "  Queue image save: " << elapsed.count() << " ms (pending: " 
+                  << pendingSaves_.load() << ")" << std::endl;
+        stepStartTime = std::chrono::high_resolution_clock::now();
+    }
     
     // Calculate time since last save
     auto currentSaveTime = std::chrono::high_resolution_clock::now();
@@ -1078,26 +1238,73 @@ void ScannerApp::scanSingleFrame() {
     
     frameCount_++;
 
-    // Convert to 8-bit if needed before sending to display
-    if (scannedFrame_.depth() == CV_16U) {
-        scannedFrame_.convertTo(scannedFrame_, CV_8U, 1.0 / 256.0);
+    // Conditionally update display (skip most updates during scan for speed)
+    // Always update during sprocket reacquisition for visual feedback
+    bool shouldUpdateDisplay = false;
+    if (!sprocketDetected_ || reacquireSprocket) {
+        shouldUpdateDisplay = true;   // Always update when searching for sprocket
+    } else if (displayUpdateInterval == 0) {
+        shouldUpdateDisplay = false;  // Never update
+    } else if (displayUpdateInterval == 1) {
+        shouldUpdateDisplay = true;   // Always update
+    } else {
+        framesSinceDisplayUpdate++;
+        if (framesSinceDisplayUpdate >= displayUpdateInterval) {
+            shouldUpdateDisplay = true;
+            framesSinceDisplayUpdate = 0;
+        }
     }
     
-    // Update display
-    updateVideoDisplay(scannedFrame_);
-    
-    // Force UI to update
-    QApplication::processEvents();
+    if (shouldUpdateDisplay) {
+        // Convert to 8-bit if needed before sending to display
+        if (scannedFrame_.depth() == CV_16U) {
+            scannedFrame_.convertTo(scannedFrame_, CV_8U, 1.0 / 256.0);
+        }
+        
+        if (detailTimeLogging) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - stepStartTime);
+            std::cout << "  8-bit conversion: " << elapsed.count() << " ms" << std::endl;
+            stepStartTime = std::chrono::high_resolution_clock::now();
+        }
+        
+        // Update display
+        updateVideoDisplay(scannedFrame_);
+        
+        if (detailTimeLogging) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - stepStartTime);
+            std::cout << "  Display update: " << elapsed.count() << " ms" << std::endl;
+            stepStartTime = std::chrono::high_resolution_clock::now();
+        }
+        
+        // Force UI to update
+        QApplication::processEvents();
+        
+        if (detailTimeLogging) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - stepStartTime);
+            std::cout << "  UI processEvents: " << elapsed.count() << " ms" << std::endl;
+            stepStartTime = std::chrono::high_resolution_clock::now();
+        }
+    } else {
+        if (detailTimeLogging) {
+            std::cout << "  Display update: SKIPPED (interval=" << displayUpdateInterval << ")" << std::endl;
+        }
+    }
  
-    // Send M400 to check that move completed during our save
-    if (marlin_) {
-        marlin_->sendGcode("M400");
-        waitingForMoveCompletion_ = true;
-        moveCompletionStartTime_ = std::chrono::high_resolution_clock::now();
+    // Send M400 to verify all moves complete, then wait for response + settling delay
+    marlin_->sendGcode("M400");
+    waitingForMoveCompletion_ = true;
+    moveCompletionStartTime_ = std::chrono::high_resolution_clock::now();
+    
+    if (detailTimeLogging) {
+        auto totalElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - frameStartTime);
+        std::cout << "  TOTAL FRAME TIME (async wait starting): " << totalElapsed.count() << " ms" << std::endl;
     }
     
-    // Note: We'll check for completion in updateFrame() next cycle
-    // This keeps the UI responsive during the move
+    // Will continue in updateFrame() after M400 response + settling delay
 
 }
 
@@ -1108,6 +1315,9 @@ void ScannerApp::findSprocket(const cv::Mat& frame) {
         return;
     }
 
+    auto sprocketStartTime = std::chrono::high_resolution_clock::now();
+    auto stepTime = sprocketStartTime;
+
     // Convert to grayscale
     cv::Mat gray;
     cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
@@ -1115,6 +1325,13 @@ void ScannerApp::findSprocket(const cv::Mat& frame) {
     // Ensure 8-bit format (photos may be 16-bit)
     if (gray.depth() != CV_8U) {
         gray.convertTo(gray, CV_8U, 1.0 / 256.0);
+    }
+    
+    if (detailTimeLogging) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - stepTime);
+        std::cout << "    Grayscale conversion: " << elapsed.count() << " μs" << std::endl;
+        stepTime = std::chrono::high_resolution_clock::now();
     }
     
     int centerY = gray.rows / 2;
@@ -1127,18 +1344,49 @@ void ScannerApp::findSprocket(const cv::Mat& frame) {
     int detectTop = centerY - (sprocketDetectHeightTemp / 2);
     int detectBottom = centerY + (sprocketDetectHeightTemp / 2);
 
+    // Add bounds checking to prevent ROI out of bounds
+    int roiX = std::max(0, std::min(leftSprocketEdge, gray.cols - 1));
+    int roiY = std::max(0, std::min(detectTop, gray.rows - 1));
+    int roiWidth = std::min(rightSprocketEdge - leftSprocketEdge, gray.cols - roiX);
+    int roiHeight = std::min(detectBottom - detectTop, gray.rows - roiY);
+    
+    // Ensure width and height are positive
+    if (roiWidth <= 0 || roiHeight <= 0) {
+        std::cerr << "Invalid ROI dimensions, skipping sprocket detection" << std::endl;
+        return;
+    }
+
     //Crop gray both horizontally and vertically to detection zone
-    cv::Mat croppedGray = gray(cv::Rect(leftSprocketEdge, detectTop, 
-                                        rightSprocketEdge - leftSprocketEdge, 
-                                        detectBottom - detectTop));
+    cv::Mat croppedGray = gray(cv::Rect(roiX, roiY, roiWidth, roiHeight));
+
+    if (detailTimeLogging) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - stepTime);
+        std::cout << "    ROI cropping: " << elapsed.count() << " μs" << std::endl;
+        stepTime = std::chrono::high_resolution_clock::now();
+    }
 
     //Threshold
     cv::Mat binary;
     cv::threshold(croppedGray, binary, sprocketBrightnessThreshold_, 255, cv::THRESH_BINARY);
     
+    if (detailTimeLogging) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - stepTime);
+        std::cout << "    Thresholding: " << elapsed.count() << " μs" << std::endl;
+        stepTime = std::chrono::high_resolution_clock::now();
+    }
+    
     // Find contours
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    
+    if (detailTimeLogging) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - stepTime);
+        std::cout << "    Find contours: " << elapsed.count() << " μs (" << contours.size() << " found)" << std::endl;
+        stepTime = std::chrono::high_resolution_clock::now();
+    }
     
     sprocketDetected_ = false;
 
@@ -1149,13 +1397,13 @@ void ScannerApp::findSprocket(const cv::Mat& frame) {
 
         if (boundingRect.height >= sprocketMinHeight_) { //Tall enough for Tinder?
             // Transform coordinates back to original frame
-            int cx = boundingRect.x + boundingRect.width / 2 + leftSprocketEdge;
-            int cy = boundingRect.y + boundingRect.height / 2 + detectTop;
+            int cx = boundingRect.x + boundingRect.width / 2 + roiX;
+            int cy = boundingRect.y + boundingRect.height / 2 + roiY;
             sprocketCenter_ = cv::Point(cx, cy);
             
             // Transform boundingRect to original frame coordinates for drawing
-            boundingRect.x += leftSprocketEdge;
-            boundingRect.y += detectTop;
+            boundingRect.x += roiX;
+            boundingRect.y += roiY;
             
             sprocketDetected_ = true;
             reacquireSprocket = false;
@@ -1164,6 +1412,13 @@ void ScannerApp::findSprocket(const cv::Mat& frame) {
         }
 
     }
+    
+    if (detailTimeLogging) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - stepTime);
+        std::cout << "    Contour analysis: " << elapsed.count() << " μs (detected: " 
+                  << (sprocketDetected_ ? "yes" : "no") << ")" << std::endl;
+    }
 
 }
 
@@ -1171,15 +1426,14 @@ void ScannerApp::advanceFilmTracking(float frames, float speed, bool waitForResp
 
     float takeupMoveMM = frames * mmPerFrame;                               // Convert frames to mm using the mm per frame value
 
-    if (currentState_ == SCANNING) {
-
-        if (skipFrameTarget > 0) {                      //If enabled (!0) skip a takeup frame every x frames
-            if (++skipFrameCount >= skipFrameTarget) {      //If enabled skip a takeup frame every x frames
-                skipFrameCount = 0;                         // Goal here is to have some slack in the takeup spool
-                takeupMoveMM = 0.0f;          //Send a zero for takeup movement this frame
-            }
+    // Apply skip frame logic for forward movements to prevent takeup spool from getting too tight
+    // This applies in all modes (SCANNING, PREVIEW, SETUP) to maintain proper tension
+    if (frames > 0 && skipFrameTarget > 0) {                      //If enabled (!0) and moving forward
+        if (++skipFrameCount >= skipFrameTarget) {      //Skip a takeup frame every x frames
+            skipFrameCount = 0;                         // Goal here is to have some slack in the takeup spool
+            takeupMoveMM = 0.0f;          //Send a zero for takeup movement this frame
+            std::cout << "Skipping takeup frame (creating slack)" << std::endl;
         }
-
     }
 
     marlin_->advanceFilm2(takeupMoveMM, frames, speed, waitForResponse);     // Advance the film by mm
@@ -1210,6 +1464,92 @@ void ScannerApp::advanceFilmTracking(float frames, float speed, bool waitForResp
 
 }
 
+// Background save thread methods
+void ScannerApp::startSaveThread() {
+    saveThreadRunning_ = true;
+    pendingSaves_ = 0;
+    saveThread_ = std::thread(&ScannerApp::saveThreadWorker, this);
+    std::cout << "Background save thread started" << std::endl;
+}
+
+void ScannerApp::stopSaveThread() {
+    if (saveThreadRunning_) {
+        std::cout << "Stopping save thread... (waiting for " << pendingSaves_.load() << " pending saves)" << std::endl;
+        
+        saveThreadRunning_ = false;
+        saveCondition_.notify_all();
+        
+        if (saveThread_.joinable()) {
+            saveThread_.join();
+        }
+        
+        std::cout << "Save thread stopped" << std::endl;
+    }
+}
+
+void ScannerApp::saveThreadWorker() {
+    while (saveThreadRunning_) {
+        SaveJob job;
+        
+        {
+            std::unique_lock<std::mutex> lock(saveMutex_);
+            saveCondition_.wait(lock, [this] { 
+                return !saveQueue_.empty() || !saveThreadRunning_; 
+            });
+            
+            if (!saveThreadRunning_ && saveQueue_.empty()) {
+                break;
+            }
+            
+            if (!saveQueue_.empty()) {
+                job = saveQueue_.front();
+                saveQueue_.pop();
+            } else {
+                continue;
+            }
+        }
+        
+        // Save the image (outside the lock)
+        auto saveStart = std::chrono::high_resolution_clock::now();
+        
+        cv::imwrite(job.filename, job.image);
+        
+        auto saveEnd = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(saveEnd - saveStart);
+        
+        pendingSaves_--;
+        
+        if (detailTimeLogging) {
+            std::cout << "  [BG Thread] Saved frame " << job.frameNumber 
+                      << " in " << duration.count() << " ms (queue: " 
+                      << pendingSaves_.load() << ")" << std::endl;
+        }
+    }
+    
+    std::cout << "Save thread worker exiting" << std::endl;
+}
+
+void ScannerApp::queueImageSave(const cv::Mat& image, const std::string& filename, int frameNumber) {
+    SaveJob job;
+    job.image = image.clone();  // Clone to ensure thread safety
+    job.filename = filename;
+    job.frameNumber = frameNumber;
+    
+    {
+        std::lock_guard<std::mutex> lock(saveMutex_);
+        saveQueue_.push(job);
+        pendingSaves_++;
+        
+        // Warn if queue is getting large (disk can't keep up)
+        if (pendingSaves_ > 5) {
+            std::cerr << "WARNING: Save queue is backing up! (" << pendingSaves_.load() 
+                      << " pending) - disk may be too slow" << std::endl;
+        }
+    }
+    
+    saveCondition_.notify_one();
+}
+
 // Slot implementations
 void ScannerApp::onStartScan() {
 
@@ -1238,6 +1578,10 @@ void ScannerApp::onStartScan() {
     scanning_ = true;
     currentState_ = SCANNING;
     frameCount_ = 0;            //TODO: Don't always reset
+    framesSinceDisplayUpdate = 0;  // Reset display update counter
+    skipFrameCount = 0;  // Reset skip frame counter for fresh start
+    waitingForMoveCompletion_ = false;  // Reset async state flags
+    waitingForSettling_ = false;
     
     fanOn_ = false;         //Set off, toggle to ON
     onFanToggle();
@@ -1256,6 +1600,16 @@ void ScannerApp::onStopScan() {
     stopButton_->setEnabled(false);
     
     std::cout << "Scan stopped. Captured " << frameCount_ << " frames." << std::endl;
+    
+    // Wait for background saves to complete
+    if (pendingSaves_ > 0) {
+        std::cout << "Waiting for " << pendingSaves_.load() << " pending saves to complete..." << std::endl;
+        while (pendingSaves_ > 0) {
+            QApplication::processEvents();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::cout << "All saves completed." << std::endl;
+    }
 
     camera_.stopPhoto();
 

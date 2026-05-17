@@ -130,7 +130,8 @@ bool PiCamera::startVideo() {
     // Store stride for later use
     videoStride_ = streamConfig.stride;
     std::cout << "Video stream configured: " << videoWidth_ << "x" << videoHeight_ 
-              << " format=" << streamConfig.pixelFormat.toString() << std::endl;
+              << " format=" << streamConfig.pixelFormat.toString() 
+              << " stride=" << videoStride_ << std::endl;
     
     // Allocate buffers
     Stream* stream = streamConfig.stream();
@@ -158,27 +159,7 @@ bool PiCamera::startVideo() {
         
         // Set controls
         ControlList& controls = request->controls();
-        
-        // Set white balance
-        if (whiteBalanceMode_ == "auto") {
-            controls.set(controls::AwbEnable, true);
-        } else {
-            controls.set(controls::AwbEnable, false);
-            if (whiteBalanceMode_ == "incandescent") {
-                controls.set(controls::ColourGains, libcamera::Span<const float, 2>({1.5f, 1.0f}));
-            } else if (whiteBalanceMode_ == "daylight") {
-                controls.set(controls::ColourGains, libcamera::Span<const float, 2>({1.0f, 1.0f}));
-            }
-        }
-        
-        // Set exposure
-        if (exposureMs_ > 0.0f) {
-            controls.set(controls::AeEnable, false);
-            controls.set(controls::ExposureTime, static_cast<int32_t>(exposureMs_ * 1000));
-            controls.set(controls::AnalogueGain, gain_);
-        } else {
-            controls.set(controls::AeEnable, true);
-        }
+        applyVideoControls(controls);
         
         videoRequests_.push_back(std::move(request));
     }
@@ -403,14 +384,16 @@ void PiCamera::videoRequestComplete(Request* request) {
         try {
             if (videoBitDepth == "RGB161616") {
                 // RGB161616 is 6 bytes per pixel (16-bit R, G, B)
-                cv::Mat rgb16Image(videoHeight_, videoWidth_, CV_16UC3, memory);
+                // Use stride to handle potential row padding
+                cv::Mat rgb16Image(videoHeight_, videoWidth_, CV_16UC3, memory, videoStride_);
                 
                 // Convert to 8-bit BGR for display
                 rgb16Image.convertTo(bgrImage, CV_8UC3, 1.0/256.0);  // Scale down to 8-bit
                 cv::cvtColor(bgrImage, bgrImage, cv::COLOR_RGB2BGR);
             } else {
                 // RGB888 is 3 bytes per pixel (8-bit R, G, B)
-                cv::Mat rgb8Image(videoHeight_, videoWidth_, CV_8UC3, memory);
+                // Use stride to handle potential row padding
+                cv::Mat rgb8Image(videoHeight_, videoWidth_, CV_8UC3, memory, videoStride_);
                 
                 // Convert RGB to BGR for display (no bit depth conversion needed)
                 cv::cvtColor(rgb8Image, bgrImage, cv::COLOR_RGB2BGR);
@@ -433,8 +416,16 @@ void PiCamera::videoRequestComplete(Request* request) {
         munmap(memory, plane.length);
     }
     
-    // Requeue the request
+    // Read current exposure from metadata so we can lock it later
+    auto expMeta = request->metadata().get(controls::ExposureTime);
+    if (expMeta) {
+        currentExposureUs_ = *expMeta;
+    }
+
+    // Requeue the request with current control settings applied
     request->reuse(Request::ReuseBuffers);
+    ControlList& reqControls = request->controls();
+    applyVideoControls(reqControls);
     camera_->queueRequest(request);
 
 }
@@ -593,6 +584,48 @@ void PiCamera::setWhiteBalance(const std::string& mode) {
 
 void PiCamera::setExposure(float milliseconds) {
     exposureMs_ = milliseconds;
+}
+
+void PiCamera::setAutoExposure(bool enable) {
+    if (enable) {
+        exposureMs_ = 0.0f;  // 0 = auto
+    } else {
+        // Lock at last known auto-exposure value
+        float lockedMs = currentExposureUs_.load() / 1000.0f;
+        exposureMs_ = (lockedMs > 0.0f) ? lockedMs : 10.0f;  // fallback 10ms
+    }
+}
+
+void PiCamera::applyVideoControls(ControlList& controls) {
+    // White balance
+    if (whiteBalanceMode_ == "auto") {
+        controls.set(controls::AwbEnable, true);
+        controls.set(controls::AwbMode, static_cast<int32_t>(controls::AwbAuto));
+    } else {
+        controls.set(controls::AwbEnable, true);
+        if (whiteBalanceMode_ == "incandescent") {
+            controls.set(controls::AwbMode, static_cast<int32_t>(controls::AwbIncandescent));
+        } else if (whiteBalanceMode_ == "tungsten") {
+            controls.set(controls::AwbMode, static_cast<int32_t>(controls::AwbTungsten));
+        } else if (whiteBalanceMode_ == "fluorescent") {
+            controls.set(controls::AwbMode, static_cast<int32_t>(controls::AwbFluorescent));
+        } else if (whiteBalanceMode_ == "indoor") {
+            controls.set(controls::AwbMode, static_cast<int32_t>(controls::AwbIndoor));
+        } else if (whiteBalanceMode_ == "daylight") {
+            controls.set(controls::AwbMode, static_cast<int32_t>(controls::AwbDaylight));
+        } else if (whiteBalanceMode_ == "cloudy") {
+            controls.set(controls::AwbMode, static_cast<int32_t>(controls::AwbCloudy));
+        }
+    }
+
+    // Exposure
+    if (exposureMs_ > 0.0f) {
+        controls.set(controls::AeEnable, false);
+        controls.set(controls::ExposureTime, static_cast<int32_t>(exposureMs_ * 1000.0f));
+        controls.set(controls::AnalogueGain, gain_);
+    } else {
+        controls.set(controls::AeEnable, true);
+    }
 }
 
 void PiCamera::setGain(float gain) {

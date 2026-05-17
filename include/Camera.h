@@ -7,6 +7,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 
 class PiCamera {
 public:
@@ -35,6 +36,7 @@ public:
     void setFramerate(int fps);
     void setWhiteBalance(const std::string& mode); // "auto", "incandescent", "tungsten", "fluorescent", "daylight"
     void setExposure(float milliseconds);
+    void setAutoExposure(bool enable);
     void setGain(float gain);
     void setDenoise(bool enable);
 
@@ -46,6 +48,7 @@ private:
     void processRequest(libcamera::Request* request);
     void videoRequestComplete(libcamera::Request* request);
     void photoRequestComplete(libcamera::Request* request);
+    void applyVideoControls(libcamera::ControlList& controls);
     
     std::unique_ptr<libcamera::CameraManager> cameraManager_;
     std::shared_ptr<libcamera::Camera> camera_;
@@ -76,6 +79,7 @@ private:
     float exposureMs_ = 0.0f;  // 0 = auto
     float gain_ = 1.0f;
     bool denoiseEnabled_ = false;
+    std::atomic<int32_t> currentExposureUs_{10000};  // Last known AE value (µs), default 10ms
     
     // State
     bool initialized_ = false;
