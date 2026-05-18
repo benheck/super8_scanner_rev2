@@ -28,6 +28,7 @@
 #include <QPalette>
 #include <QRadioButton>
 #include <QButtonGroup>
+#include <QCheckBox>
 
 #include <opencv2/opencv.hpp>
 #include <iostream>
@@ -159,6 +160,8 @@ private:
     QRadioButton* radio8bitDepth_;
     QRadioButton* radio16bitDepth_;
     QButtonGroup* bitDepthGroup_;
+    QCheckBox* detailTimeLoggingCheck_;
+
 
     QPushButton* setSpoolDiameterButton = new QPushButton("Set Spool Diameter");
     QPushButton* setSkipTakeupFrameButton = new QPushButton("Set Skip Takeup Frames");
@@ -199,7 +202,7 @@ private:
     cv::Mat setupFrame_;
     cv::Mat scannedFrame_;
     
-    bool detailTimeLogging = true;
+    bool detailTimeLogging = false;
     
     // Background save thread
     std::thread saveThread_;
@@ -440,7 +443,10 @@ void ScannerApp::initializeUI() {
     radio16bitDepth_->setStyleSheet("color: white; font-size: 14px; padding: 5px;");
     rightLayout->addWidget(radio8bitDepth_, 12, 1);
     rightLayout->addWidget(radio16bitDepth_, 13, 1);
-
+    detailTimeLoggingCheck_ = new QCheckBox("Detail Time Logging");
+    detailTimeLoggingCheck_->setChecked(false);
+    detailTimeLoggingCheck_->setStyleSheet("color: white; font-size: 14px; padding: 5px;");
+    rightLayout->addWidget(detailTimeLoggingCheck_, 14, 1);
 
 
     // Add panels to main layout
@@ -589,6 +595,11 @@ void ScannerApp::connectSignals() {
     
     // Bit depth radio button connection
     connect(bitDepthGroup_, &QButtonGroup::idClicked, this, &ScannerApp::onBitDepthChanged);
+
+    // Detail time logging checkbox
+    connect(detailTimeLoggingCheck_, &QCheckBox::toggled, [this](bool checked) {
+        detailTimeLogging = checked;
+    });
 
     // Color temperature cycling
     connect(colorTempButton_, &QPushButton::clicked, [this]() {
@@ -1294,6 +1305,7 @@ void ScannerApp::scanSingleFrame() {
     }
  
     // Send M400 to verify all moves complete, then wait for response + settling delay
+    marlin_->flushReadBuffer();  // Discard G1 command-ack "ok" so checkForOK() only sees M400's response
     marlin_->sendGcode("M400");
     waitingForMoveCompletion_ = true;
     moveCompletionStartTime_ = std::chrono::high_resolution_clock::now();
@@ -1615,6 +1627,9 @@ void ScannerApp::onStopScan() {
 
     fanOn_ = true;         //Set on, toggle to OFF
     onFanToggle();
+
+    lightOn_ = true;       //Set on, toggle to OFF
+    onLightToggle();
 
     onSwitchToPreview();    //Manually back to this
 

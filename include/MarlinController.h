@@ -30,6 +30,7 @@ public:
 
     void waitForMoveCompletion();
     bool checkForOK();
+    void flushReadBuffer();  // Discard any pending data before issuing M400
 
     // Status
     std::string getLastResponse() const;
@@ -47,6 +48,8 @@ private:
     std::unique_ptr<boost::asio::io_service> ioService_;
     std::unique_ptr<boost::asio::serial_port> serialPort_;
     
+    boost::asio::streambuf readBuffer_;  // Persistent buffer — preserves partial reads across calls
+
     std::string lastResponse_;
     mutable std::mutex mutex_;
 };

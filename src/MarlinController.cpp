@@ -2,6 +2,15 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <algorithm>
+#include <cctype>
+
+// Returns true if the response line contains "ok" (case-insensitive)
+static bool containsOk(const std::string& s) {
+    std::string lower(s.size(), '\0');
+    std::transform(s.begin(), s.end(), lower.begin(), ::tolower);
+    return lower.find("ok") != std::string::npos;
+}
 
 MarlinController::MarlinController(const std::string& port, unsigned int baudRate)
     : port_(port), baudRate_(baudRate) {
@@ -107,51 +116,45 @@ void MarlinController::waitForOk(int timeout_ms) {
     
     while (true) {
         try {
-            // Try to read with a short timeout
-            boost::asio::streambuf responseBuffer;
-            
-            // Set a deadline for the read operation
             boost::asio::deadline_timer timer(*ioService_);
             timer.expires_from_now(boost::posix_time::milliseconds(100));
             
             boost::system::error_code ec;
             bool dataRead = false;
             
-            // Start async read
-            boost::asio::async_read_until(*serialPort_, responseBuffer, "\n",
+            boost::asio::async_read_until(*serialPort_, readBuffer_, "\n",
                 [&](const boost::system::error_code& error, std::size_t) {
                     ec = error;
                     dataRead = true;
                     timer.cancel();
                 });
             
-            // Start timer
             timer.async_wait([&](const boost::system::error_code& error) {
                 if (!error) {
                     serialPort_->cancel();
                 }
             });
             
-            // Run the IO service
             ioService_->reset();
             ioService_->run();
             
             if (dataRead && !ec) {
-                std::istream responseStream(&responseBuffer);
+                std::istream responseStream(&readBuffer_);
                 std::string response;
                 std::getline(responseStream, response);
                 
-                // Remove carriage return if present
                 if (!response.empty() && response.back() == '\r') {
                     response.pop_back();
                 }
                 
-                std::lock_guard<std::mutex> lock(mutex_);
-                lastResponse_ = response;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    lastResponse_ = response;
+                }
                 
                 std::cout << "Response: " << response << std::endl;
                 
-                if (response.find("ok") != std::string::npos) {
+                if (containsOk(response)) {
                     break;
                 }
             }
@@ -233,21 +236,44 @@ void MarlinController::waitForMoveCompletion() {
     waitForOk();
 }
 
+void MarlinController::flushReadBuffer() {
+    // Drain any bytes already in the persistent buffer (e.g. G1 command acks)
+    // so that the next checkForOK() only sees fresh responses.
+    if (readBuffer_.size() > 0) {
+        readBuffer_.consume(readBuffer_.size());
+    }
+    // Also drain anything sitting in the OS serial buffer (non-blocking, 0ms timer)
+    if (!connected_ || !serialPort_ || !serialPort_->is_open()) return;
+    try {
+        boost::asio::deadline_timer timer(*ioService_);
+        timer.expires_from_now(boost::posix_time::milliseconds(0));
+        bool done = false;
+        boost::asio::streambuf tmp;
+        boost::asio::async_read_until(*serialPort_, tmp, "\n",
+            [&](const boost::system::error_code&, std::size_t) { done = true; timer.cancel(); });
+        timer.async_wait([&](const boost::system::error_code& error) {
+            if (!error) serialPort_->cancel();
+        });
+        ioService_->reset();
+        ioService_->run();
+        (void)done;
+    } catch (...) {}
+}
+
 bool MarlinController::checkForOK() {
     if (!connected_ || !serialPort_ || !serialPort_->is_open()) {
         return false;
     }
     
     try {
-        boost::asio::streambuf responseBuffer;
         boost::asio::deadline_timer timer(*ioService_);
-        timer.expires_from_now(boost::posix_time::milliseconds(1)); // Very short timeout
+        timer.expires_from_now(boost::posix_time::milliseconds(1));
         
         boost::system::error_code ec;
         bool dataRead = false;
         
-        // Start async read
-        boost::asio::async_read_until(*serialPort_, responseBuffer, "\n",
+        // Start async read into the persistent buffer
+        boost::asio::async_read_until(*serialPort_, readBuffer_, "\n",
             [&](const boost::system::error_code& error, std::size_t) {
                 ec = error;
                 dataRead = true;
@@ -265,27 +291,30 @@ bool MarlinController::checkForOK() {
         ioService_->reset();
         ioService_->run();
         
+        // If a full line is already in the persistent buffer (from a previous partial read
+        // or from this read), extract it regardless of whether the async op completed.
+        // read_until guarantees that if it succeeds, the delimiter is in the buffer.
         if (dataRead && !ec) {
-            std::istream responseStream(&responseBuffer);
+            std::istream responseStream(&readBuffer_);
             std::string response;
             std::getline(responseStream, response);
             
-            // Remove carriage return if present
             if (!response.empty() && response.back() == '\r') {
                 response.pop_back();
             }
             
-            std::lock_guard<std::mutex> lock(mutex_);
-            lastResponse_ = response;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                lastResponse_ = response;
+            }
             
             std::cout << "Response: " << response << std::endl;
             
-            return response.find("ok") != std::string::npos;
+            return containsOk(response);
         }
         
         return false;
     } catch (const std::exception &e) {
-        // No data available or error reading
         return false;
     }
 }
